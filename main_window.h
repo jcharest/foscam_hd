@@ -3,7 +3,6 @@
 
 #include <QMainWindow>
 #include <QMediaPlayer>
-#include <foscam_device.h>
 #include <foscam.h>
 
 namespace Ui {
@@ -25,7 +24,7 @@ private:
     Ui::MainWindow *ui;
     QMediaPlayer mMediaPlayer;
     Foscam mCam;
-    FoscamDevice mDev;
+    //FoscamDevice mDev;
 };
 
 #endif // MAIN_WINDOW_H

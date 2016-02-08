@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <poll.h>
 #include <memory>
+
 #include "foscam.h"
 
 using namespace std;
@@ -292,10 +293,45 @@ const char* FoscamException::what() const noexcept
 	return ("FoscamException" + mstrWhat).c_str();
 }
 
+class ReadPacketFunc : public DataFunctor
+{
+public:
+	ReadPacketFunc(mutex & in_DataMutex, queue<uint8_t> & in_DataBuffer)
+	 : mDataMutex(in_DataMutex), mDataBuffer(in_DataBuffer)
+	{
+	}
+
+	virtual int operator()(uint8_t * out_aun8Buffer, int in_nBufferSize) override
+	{
+		lock_guard<mutex> Lock(mDataMutex);
+
+		int nReadSize = min(static_cast<int>(mDataBuffer.size()), in_nBufferSize);
+		for(int nBufferIdx = 0; nBufferIdx < nReadSize; nBufferIdx++)
+		{
+			out_aun8Buffer[nBufferIdx] = mDataBuffer.front();
+			mDataBuffer.pop();
+		}
+		return nReadSize;
+	}
+
+	virtual size_t GetAvailableData() override
+	{
+		lock_guard<mutex> Lock(mDataMutex);
+
+		return mDataBuffer.size();
+	}
+
+private:
+	mutex & mDataMutex;
+	queue<uint8_t> & mDataBuffer;
+};
+
 Foscam::Foscam(const string & in_strIPAddress, unsigned int in_unPort, unsigned int in_unUID,
-		const std::string & in_strUser, const std::string & in_strPassword)
- : munUID(in_unUID), mstrUser(in_strUser), mstrPassword(in_strPassword), mfStartDataThread(false),
-   mfStopDataThread(false), mDataThread(&Foscam::DataThread, this)
+		const std::string & in_strUser, const std::string & in_strPassword, const int in_Framerate)
+ : munUID(in_unUID), mstrUser(in_strUser), mstrPassword(in_strPassword), mnFramerate(in_Framerate),
+   mfStartDataThread(false), mfStopDataThread(false), mDataThread(&Foscam::DataThread, this),
+   mRemuxer(make_unique<ReadPacketFunc>(mDataThreadMutex, mVideoBuffer),
+		    make_unique<ReadPacketFunc>(mDataThreadMutex, mAudioBuffer), {1, mnFramerate})
 {
 	struct AddrInfoDeleter {
 		void operator()(struct addrinfo* p) {
@@ -388,7 +424,6 @@ bool Foscam::AudioOn()
 	return true;
 }
 
-
 unsigned int Foscam::GetVideoDataAvailable()
 {
 	unique_lock<mutex> Lock(mDataThreadMutex);
@@ -479,7 +514,7 @@ void Foscam::DataThread()
 
 			case Command::VIDEO_DATA:
 			{
-				vector<char> VideoData(Event.un32Size);
+				vector<uint8_t> VideoData(Event.un32Size);
 				if(RevcLoop(mSock, VideoData.data(), Event.un32Size) < 0 )
 				{
 					throw FoscamException(string("Failed to receive video data: ") + strerror(errno));

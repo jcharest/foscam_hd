@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <thread>
 #include <queue>
+#include <ffmpeg_remuxer.h>
 #include <ip_cam.h>
 
 class FoscamException : std::exception
@@ -24,7 +25,7 @@ class Foscam : public IPCam
 {
 public:
     Foscam(const std::string & in_strIPAddress, unsigned int in_unPort, unsigned int in_unUID,
-    		const std::string & in_strUser, const std::string & in_strPassword);
+    		const std::string & in_strUser, const std::string & in_strPassword, const int in_Framerate);
     ~Foscam();
 
     virtual bool VideoOn() override;
@@ -39,6 +40,7 @@ private:
     unsigned int munUID;
     const std::string mstrUser;
     const std::string mstrPassword;
+    const int mnFramerate;
     std::mutex mDataThreadMutex;
     std::condition_variable mVideoOnReplyCond;
     std::condition_variable mAudioOnReplyCond;
@@ -47,6 +49,8 @@ private:
     std::thread mDataThread;
     std::queue<uint8_t> mVideoBuffer;
     std::queue<uint8_t> mAudioBuffer;
+
+    FFMpegRemuxer mRemuxer;
 };
 
 #endif // FOSCAM_H
