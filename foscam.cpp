@@ -2,30 +2,30 @@
 #include <cstring>
 #include <iostream>
 #include <vector>
-#include <fstream>
-
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <unistd.h>
-#include <poll.h>
 #include <memory>
+
+#include <boost/fusion/include/define_struct.hpp>
+#include <boost/fusion/include/for_each.hpp>
+#include <boost/shared_array.hpp>
+
+#include <endian.h>
 
 #include "foscam.h"
 
 using namespace std;
+using boost::asio::ip::tcp;
 
 const string CREATE_CONN_MESSAGE_START = "SERVERPUSH / HTTP/1.1\r\nHost: ";
 const string CREATE_CONN_MESSAGE_END = "\r\nAccept:*/*\r\nConnection: Close\r\n\r\n";
 const char HEADER_MAGIC[] = "FOSC";
 
+const unsigned int MAX_QUEUE_SIZE = 1024 * 1024;
+
 enum class Command : uint32_t
 {
 	VIDEO_ON_REQUEST = 0x00,
 	CLOSE_CONNECTION = 0x01,
-    AUDIO_ON = 0x02,
+  AUDIO_ON_REQUEST = 0x02,
     AUDIO_OFF = 0x03,
 	VIDEO_ON_REPLY = 0x10,
 	AUDIO_ON_REPLY = 0x12,
@@ -56,215 +56,277 @@ enum class Command : uint32_t
     STREAM_SELECT_REPLY = 0x71
 };
 
-struct __attribute__((__packed__)) Header
+
+namespace endian
 {
-	Header()
+  template<class T> T ntoh(T) = delete;
+  uint32_t ntoh(uint32_t v) { return le32toh(v); }
+  uint16_t ntoh(uint16_t v) { return le16toh(v); }
+  uint8_t ntoh(uint8_t v) { return v; }
+  int8_t ntoh(int8_t v) { return v; }
+  char ntoh(char v) { return v; }
+
+  template<class T> T hton(T) = delete;
+  uint32_t hton(uint32_t v) { return htole32(v); }
+  uint16_t hton(uint16_t v) { return htole16(v); }
+  uint8_t hton(uint8_t v) { return v; }
+  int8_t hton(int8_t v) { return v; }
+  char hton(char v) { return v; }
+}
+
+namespace foscam_api
+{
+  using Magic = integral_constant<uint32_t, 0x43534f46>; // FOSC
+
+  enum class Videostream : uint8_t
+  {
+    MAIN = 0,
+    SUB = 1
+  };
+
+  template<size_t N>
+  struct FixedString
+  {
+    static const size_t size = N;
+
+    char str[N];
+  };
+
+  template<size_t N>
+  struct Reserved
+  {
+    static const size_t size = N;
+  };
+}
+
+BOOST_FUSION_DEFINE_STRUCT(
+    (foscam_api), Header,
+    (Command, type)
+    (foscam_api::Magic, magic)
+    (uint32_t, size)
+)
+
+BOOST_FUSION_DEFINE_STRUCT(
+    (foscam_api), VideoOnRequest,
+    (foscam_api::Videostream, stream)
+    (foscam_api::FixedString<64>, username)
+    (foscam_api::FixedString<64>, password)
+    (uint32_t, uid)
+    (foscam_api::Reserved<28>, reserved)
+)
+
+BOOST_FUSION_DEFINE_STRUCT(
+    (foscam_api), CloseConnection,
+    (foscam_api::Reserved<1>, reserved)
+    (foscam_api::FixedString<64>, username)
+    (foscam_api::FixedString<64>, password)
+)
+
+BOOST_FUSION_DEFINE_STRUCT(
+    (foscam_api), VideoOnReply,
+    (uint8_t, failed)
+    (foscam_api::Reserved<35>, reserved)
+)
+
+BOOST_FUSION_DEFINE_STRUCT(
+    (foscam_api), AudioOnRequest,
+    (foscam_api::Reserved<1>, reserved0)
+    (foscam_api::FixedString<64>, username)
+    (foscam_api::FixedString<64>, password)
+    (foscam_api::Reserved<32>, reserved1)
+)
+
+BOOST_FUSION_DEFINE_STRUCT(
+    (foscam_api), AudioOnReply,
+    (uint8_t, failed)
+    (foscam_api::Reserved<35>, reserved)
+)
+
+BOOST_FUSION_DEFINE_STRUCT(
+    (foscam_api), AudioDataHeader,
+    (foscam_api::Reserved<36>, reserved)
+)
+
+
+struct Reader {
+    mutable boost::asio::const_buffer buf_;
+
+    explicit Reader(boost::asio::const_buffer buf) : buf_(std::move(buf))
     {
-		memset(this, 0, sizeof(*this));
     }
 
-	Header(Command in_Type, unsigned int in_unSize) : Type(in_Type), un32Size(in_unSize)
+    template<class T>
+    auto operator()(T & val) const ->
+        typename std::enable_if<std::is_integral<T>::value>::type
     {
-        memcpy(aun8Magic, HEADER_MAGIC, sizeof(aun8Magic));
+        val = endian::ntoh(*boost::asio::buffer_cast<T const*>(buf_));
+        buf_ = buf_ + sizeof(T);
     }
 
-	void Check()
-	{
-		if(memcmp(HEADER_MAGIC, aun8Magic, strlen(HEADER_MAGIC)) != 0)
-		{
-			throw FoscamException("Invalid header magic.");
-		}
-	}
+    template<class T>
+    auto operator()(T & val) const ->
+        typename std::enable_if<std::is_enum<T>::value>::type
+    {
+        typename std::underlying_type<T>::type v;
+        (*this)(v);
+        val = static_cast<T>(v);
+    }
 
-	void Check(Command in_ExpectedType, int in_nExpectedSize)
-	{
-		Check();
-		if(Type != in_ExpectedType)
-		{
-			throw FoscamException("Invalid header type.");
-		}
-		if(in_nExpectedSize > 0 && un32Size != static_cast<unsigned int>(in_nExpectedSize))
-		{
-			throw FoscamException("Invalid size.");
-		}
-	}
+    template<class T, T v>
+    void operator()(std::integral_constant<T, v>) const
+    {
+        typedef std::integral_constant<T, v> type;
+        typename type::value_type val;
+        (*this)(val);
+        if (val != type::value)
+            throw FoscamException("Invalid integral constant.");
+    }
 
-	void * GetData()
-	{
-		return &un32Size + 1;
-	}
+    template<size_t N>
+    void operator()(foscam_api::Reserved<N>) const
+    {
+      buf_ = buf_ + N;
+    }
 
-	Command Type;
-    uint8_t aun8Magic[4];
-    uint32_t un32Size;
+    template<size_t N>
+    void operator()(foscam_api::FixedString<N>& val) const
+    {
+      for(size_t idx = 0; idx < N; idx++)
+      {
+        char v;
+        (*this)(v);
+        val.str[idx] = v;
+      }
+    }
+
+    template<class T>
+    auto operator()(T & val) const ->
+    typename std::enable_if<boost::fusion::traits::is_sequence<T>::value>::type {
+        boost::fusion::for_each(val, *this);
+    }
 };
 
-struct __attribute__((__packed__)) CloseConnectionRequest : public Header
-{
-	enum class Videostream : uint8_t
-	{
-		MAIN = 0,
-		SUB = 1
-	};
+struct Writer {
+    mutable boost::asio::mutable_buffer buf_;
 
-	CloseConnectionRequest(const string & in_strUsername, const string & in_strPassword)
-	 : Header(Command::CLOSE_CONNECTION, GetDataSize())
-	{
-		memset(aun8Reserved0, 0, sizeof(aun8Reserved0));
-		memset(szUsername, 0, sizeof(szUsername));
-		strncpy(szUsername, in_strUsername.c_str(), sizeof(szUsername) - 1);
-		memset(szPassword, 0, sizeof(szPassword));
-		strncpy(szPassword, in_strPassword.c_str(), sizeof(szPassword) - 1);
-	}
+    explicit Writer(boost::asio::mutable_buffer buf) : buf_(std::move(buf))
+    {
+    }
 
-	static constexpr unsigned int GetDataSize()
-	{
-		return sizeof(CloseConnectionRequest) - sizeof(Header);
-	}
+    template<class T>
+    auto operator()(T const& val) const ->
+        typename std::enable_if<std::is_integral<T>::value>::type {
+        T tmp = endian::hton(val);
+        boost::asio::buffer_copy(buf_, boost::asio::buffer(&tmp, sizeof(T)));
+        buf_ = buf_ + sizeof(T);
+    }
 
-	uint8_t aun8Reserved0[1];
-	char szUsername[64];
-	char szPassword[64];
+    template<class T>
+    auto operator()(T const& val) const ->
+        typename std::enable_if<std::is_enum<T>::value>::type {
+        using utype = typename std::underlying_type<T>::type;
+        (*this)(static_cast<utype>(val));
+    }
+
+    template<class T, T v>
+    void operator()(std::integral_constant<T, v>) const {
+        typedef std::integral_constant<T, v> type;
+        (*this)(type::value);
+    }
+
+    template<size_t N>
+    void operator()(foscam_api::Reserved<N>) const
+    {
+      for(size_t idx = 0; idx < N; idx++)
+      {
+        (*this)(static_cast<uint8_t>(0));
+      }
+    }
+
+    template<size_t N>
+    void operator()(foscam_api::FixedString<N> const& val) const
+    {
+      for(size_t idx = 0; idx < N; idx++)
+      {
+        (*this)(val.str[idx]);
+      }
+    }
+
+    template<class T>
+    auto operator()(T const& val) const ->
+    typename std::enable_if<boost::fusion::traits::is_sequence<T>::value>::type {
+        boost::fusion::for_each(val, *this);
+    }
 };
 
-struct __attribute__((__packed__)) VideoOnRequest : public Header
-{
-	enum class Videostream : uint8_t
-	{
-		MAIN = 0,
-		SUB = 1
-	};
+struct Sizer {
+    mutable size_t size_ = 0;
 
-	VideoOnRequest(const string & in_strUsername, const string & in_strPassword, unsigned int in_unUID)
-	 : Header(Command::VIDEO_ON_REQUEST, GetDataSize()), Stream(Videostream::MAIN), un32UID(in_unUID)
-	{
-		memset(szUsername, 0, sizeof(szUsername));
-		strncpy(szUsername, in_strUsername.c_str(), sizeof(szUsername) - 1);
-		memset(szPassword, 0, sizeof(szPassword));
-		strncpy(szPassword, in_strPassword.c_str(), sizeof(szPassword) - 1);
-		memset(aun8Reserved1, 0, sizeof(aun8Reserved1));
-	}
+    explicit Sizer() : size_(0)
+    {
+    }
 
-	static constexpr unsigned int GetDataSize()
-	{
-		return sizeof(VideoOnRequest) - sizeof(Header);
-	}
+    template<class T>
+    auto operator()(T const&) const ->
+        typename std::enable_if<std::is_integral<T>::value>::type {
+      size_ += sizeof(T);
+    }
 
-	Videostream Stream;
-	char szUsername[64];
-	char szPassword[64];
-	uint32_t un32UID;
-	uint8_t aun8Reserved1[28];
-};
-struct __attribute__((__packed__)) VideoOnReply : public Header
-{
-	VideoOnReply(const Header & in_Header)
-	 : Header(in_Header), un8Failed(0)
-	{
-		memset(aun8Reserved0, 0, sizeof(aun8Reserved0));
-	}
+    template<class T>
+    auto operator()(T const&) const ->
+        typename std::enable_if<std::is_enum<T>::value>::type {
+        typename std::underlying_type<T>::type v;
+        (*this)(v);
+    }
 
-	static constexpr unsigned int GetDataSize()
-	{
-		return sizeof(VideoOnReply) - sizeof(Header);
-	}
+    template<class T, T v>
+    void operator()(std::integral_constant<T, v>) const {
+        typedef std::integral_constant<T, v> type;
+        typename type::value_type val;
+        (*this)(val);
+    }
 
-	void CheckHeader()
-	{
-		Header::Check(Command::VIDEO_ON_REPLY, GetDataSize());
-	}
+    template<size_t N>
+    void operator()(foscam_api::Reserved<N>) const
+    {
+      size_ += N;
+    }
 
-	void CheckData()
-	{
-		if(un8Failed != 0)
-		{
-			throw FoscamException("Failed to enable video.");
-		}
-	}
+    template<size_t N>
+    void operator()(foscam_api::FixedString<N>) const
+    {
+      size_ += N;
+    }
 
-	uint8_t	un8Failed;
-	uint8_t aun8Reserved0[35];
+    template<class T>
+    auto operator()(T const& val) const ->
+    typename std::enable_if<boost::fusion::traits::is_sequence<T>::value>::type {
+        boost::fusion::for_each(val, *this);
+    }
 };
 
-struct __attribute__((__packed__)) AudioOnRequest : public Header
-{
-	AudioOnRequest(const string & in_strUsername, const string & in_strPassword)
-	 : Header(Command::AUDIO_ON, GetDataSize())
-	{
-		memset(aun8Reserved0, 0, sizeof(aun8Reserved0));
-		memset(szUsername, 0, sizeof(szUsername));
-		strncpy(szUsername, in_strUsername.c_str(), sizeof(szUsername) - 1);
-		memset(szPassword, 0, sizeof(szPassword));
-		strncpy(szPassword, in_strPassword.c_str(), sizeof(szPassword) - 1);
-		memset(aun8Reserved1, 0, sizeof(aun8Reserved1));
-	}
+template<typename T>
+std::pair<T, boost::asio::const_buffer> read(boost::asio::const_buffer b) {
+    Reader r(std::move(b));
+    T res;
+    r(res);
+    return std::make_pair(res, r.buf_);
+}
 
-	static constexpr unsigned int GetDataSize()
-	{
-		return sizeof(AudioOnRequest) - sizeof(Header);
-	}
+template<typename T>
+boost::asio::mutable_buffer write(boost::asio::mutable_buffer b, T const& val) {
+    Writer w(std::move(b));
+    w(val);
+    return w.buf_;
+}
 
-	uint8_t aun8Reserved0[1];
-	char szUsername[64];
-	char szPassword[64];
-	uint8_t aun8Reserved1[32];
-};
-struct __attribute__((__packed__)) AudioOnReply : public Header
-{
-	AudioOnReply(const Header & in_Header)
-	 : Header(in_Header), un8Failed(0)
-	{
-		memset(aun8Reserved0, 0, sizeof(aun8Reserved0));
-	}
-
-	static constexpr unsigned int GetDataSize()
-	{
-		return sizeof(AudioOnReply) - sizeof(Header);
-	}
-
-	void CheckHeader()
-	{
-		Header::Check(Command::AUDIO_ON_REPLY, GetDataSize());
-	}
-
-	void CheckData()
-	{
-		if(un8Failed != 0)
-		{
-			throw FoscamException("Failed to enable audio.");
-		}
-	}
-
-	uint8_t	un8Failed;
-	uint8_t aun8Reserved0[35];
-};
-struct __attribute__((__packed__)) AudioData : public Header
-{
-	AudioData(const Header & in_Header)
-	 : Header(in_Header), un32DataSize(0)
-	{
-	}
-
-	static constexpr unsigned int GetDataSize()
-	{
-		return sizeof(AudioData) - sizeof(Header);
-	}
-
-	void CheckHeader()
-	{
-		Header::Check(Command::AUDIO_DATA, -1);
-	}
-
-	void CheckData()
-	{
-		//if(un32DataSize - sizeof(un32DataSize) != un32Size)
-		//{
-		//	throw FoscamException("Invalid audio data.");
-		//}
-	}
-
-	uint32_t un32DataSize;
-};
+template<class T>
+size_t get_size() {
+    Sizer s;
+    T v;
+    s(v);
+    return s.size_;
+}
 
 template<typename Data>
 static int RevcLoop(int in_Sock, Data * in_pData, unsigned int in_unDataLength)
@@ -283,286 +345,313 @@ static int RevcLoop(int in_Sock, Data * in_pData, unsigned int in_unDataLength)
 	return unDataRead;
 }
 
-FoscamException::FoscamException(const std::string & in_strWhat) : mstrWhat(in_strWhat)
+FoscamException::FoscamException(const std::string & in_strWhat) : mstrWhat("FoscamException: " + in_strWhat)
 {
 
 }
 
 const char* FoscamException::what() const noexcept
 {
-	return ("FoscamException" + mstrWhat).c_str();
+	return mstrWhat.c_str();
 }
 
-class ReadPacketFunc : public DataFunctor
+class ReadPacketFunc : public InDataFunctor
 {
 public:
-	ReadPacketFunc(mutex & in_DataMutex, queue<uint8_t> & in_DataBuffer)
-	 : mDataMutex(in_DataMutex), mDataBuffer(in_DataBuffer)
+	ReadPacketFunc(boost::lockfree::spsc_queue<uint8_t> & in_DataBuffer)
+	 : mDataBuffer(in_DataBuffer)
 	{
 	}
 
 	virtual int operator()(uint8_t * out_aun8Buffer, int in_nBufferSize) override
 	{
-		lock_guard<mutex> Lock(mDataMutex);
-
-		int nReadSize = min(static_cast<int>(mDataBuffer.size()), in_nBufferSize);
-		for(int nBufferIdx = 0; nBufferIdx < nReadSize; nBufferIdx++)
-		{
-			out_aun8Buffer[nBufferIdx] = mDataBuffer.front();
-			mDataBuffer.pop();
-		}
-		return nReadSize;
+		return mDataBuffer.pop(out_aun8Buffer, in_nBufferSize);
 	}
 
 	virtual size_t GetAvailableData() override
 	{
-		lock_guard<mutex> Lock(mDataMutex);
-
-		return mDataBuffer.size();
+		return mDataBuffer.read_available();
 	}
 
 private:
-	mutex & mDataMutex;
-	queue<uint8_t> & mDataBuffer;
+	boost::lockfree::spsc_queue<uint8_t> & mDataBuffer;
 };
 
-Foscam::Foscam(const string & in_strIPAddress, unsigned int in_unPort, unsigned int in_unUID,
-		const std::string & in_strUser, const std::string & in_strPassword, const int in_Framerate)
- : munUID(in_unUID), mstrUser(in_strUser), mstrPassword(in_strPassword), mnFramerate(in_Framerate),
-   mfStartDataThread(false), mfStopDataThread(false), mDataThread(&Foscam::DataThread, this),
-   mRemuxer(make_unique<ReadPacketFunc>(mDataThreadMutex, mVideoBuffer),
-		    make_unique<ReadPacketFunc>(mDataThreadMutex, mAudioBuffer), {1, mnFramerate})
+class VideoStreamFunc : public OutStreamFunctor
 {
-	struct AddrInfoDeleter {
-		void operator()(struct addrinfo* p) {
-			if(p)
-			{
-				freeaddrinfo(p);
-			}
-		}
-	};
-	unique_ptr<struct addrinfo, AddrInfoDeleter> ptrServinfo;
-
-	struct addrinfo Hints;
-	memset(&Hints, 0, sizeof(Hints));
-	Hints.ai_family = AF_INET;
-	Hints.ai_socktype = SOCK_STREAM;
-
-	// get ready to connect
+public:
+	VideoStreamFunc(boost::lockfree::spsc_queue<uint8_t> & in_DataBuffer)
+	 : mDataBuffer(in_DataBuffer)
 	{
-		struct addrinfo * pServInfo = nullptr;
-		auto Status = getaddrinfo(in_strIPAddress.c_str(), to_string(in_unPort).c_str(), &Hints, &pServInfo);
-		ptrServinfo.reset(pServInfo);
-		pServInfo = nullptr;
-		if(Status != 0)
-		{
-			throw FoscamException(string("Failed to get camera address info: ") + gai_strerror(Status));
-		}
 	}
 
-    mSock = socket(ptrServinfo->ai_family, ptrServinfo->ai_socktype, ptrServinfo->ai_protocol);;
-    if(mSock < 0)
-    {
-    	throw FoscamException(string("Failed to open operations socket: ") + strerror(errno));
-    }
+	virtual int operator()(const uint8_t * in_aun8Buffer, int in_nBufferSize) override
+	{
+		return mDataBuffer.push(in_aun8Buffer, in_nBufferSize);
+	}
 
-    if(connect(mSock, ptrServinfo->ai_addr, ptrServinfo->ai_addrlen) < 0)
-    {
-    	throw FoscamException(string("Failed to connect to camera: ") + strerror(errno));
-    }
+private:
+	boost::lockfree::spsc_queue<uint8_t> & mDataBuffer;
+};
 
-    string strConnMessage = CREATE_CONN_MESSAGE_START + in_strIPAddress + ":" + to_string(in_unPort) + CREATE_CONN_MESSAGE_END;
-    if(send(mSock, strConnMessage.c_str(), strConnMessage.size(), 0) < 0 )
-    {
-    	throw FoscamException(string("Failed to connect to camera (http): ") + strerror(errno));
-    }
+Foscam::Foscam(boost::asio::io_service & io_service, const string & host, unsigned int port, unsigned int uid,
+		const string & user, const string & password, const int framerate)
+ : io_service_(io_service), socket_(io_service), uid_(uid), user_(user), password_(password), framerate_(framerate),
+   video_buffer_(MAX_QUEUE_SIZE), audio_buffer_(MAX_QUEUE_SIZE), video_stream_buffer_(MAX_QUEUE_SIZE),
+   remuxer_(make_unique<ReadPacketFunc>(video_buffer_),
+		    make_unique<ReadPacketFunc>(audio_buffer_),
+			make_unique<VideoStreamFunc>(video_stream_buffer_), framerate)
+{
+	tcp::resolver resolver(io_service_);
+	string port_str = to_string(port);
+	boost::asio::connect(socket_, resolver.resolve({host, port_str}));
 
-    mfStartDataThread = true;
+	string conn_message = CREATE_CONN_MESSAGE_START + host + ":" + port_str + CREATE_CONN_MESSAGE_END;
+	boost::asio::write(socket_, boost::asio::buffer(conn_message));
 }
 
 Foscam::~Foscam()
 {
-	mfStopDataThread = true;
-	mDataThread.join();
+}
 
-	CloseConnectionRequest Request(mstrUser, mstrPassword);
-	if(send(mSock, &Request, sizeof(Request), 0) < 0 )
-	{
-		cerr << "Failed to send close connection request" << endl;
-	}
+void Foscam::Connect()
+{
+  do_read_header();
+}
 
-	close(mSock);
+void Foscam::Disconnect()
+{
+  foscam_api::Header header;
+  header.type = Command::CLOSE_CONNECTION;
+  header.size = get_size<foscam_api::CloseConnection>();
+  foscam_api::CloseConnection request;
+  strncpy(request.username.str, user_.c_str(), request.username.size);
+  strncpy(request.password.str, password_.c_str(), request.password.size);
+
+  auto header_size = get_size<foscam_api::Header>();
+  vector<uint8_t> message_buf(header_size + header.size);
+  write(boost::asio::buffer(message_buf), header);
+  write(boost::asio::buffer(message_buf) + header_size, request);
+
+  boost::asio::write(socket_, boost::asio::buffer(message_buf));
 }
 
 bool Foscam::VideoOn()
 {
-	unique_lock<mutex> Lock(mDataThreadMutex);
+	unique_lock<mutex> lock(reply_cond_mutex_);
 
-	VideoOnRequest Request(mstrUser, mstrPassword, munUID);
-	if(send(mSock, &Request, sizeof(Request), 0) < 0 )
-	{
-		throw FoscamException(string("Failed to send video on request: ") + strerror(errno));
-	}
+	foscam_api::Header header;
+	header.type = Command::VIDEO_ON_REQUEST;
+	header.size = get_size<foscam_api::VideoOnRequest>();
+	foscam_api::VideoOnRequest request;
+	request.stream = foscam_api::Videostream::MAIN;
+	strncpy(request.username.str, user_.c_str(), request.username.size);
+	strncpy(request.password.str, password_.c_str(), request.password.size);
+	request.uid = uid_;
 
-	mVideoOnReplyCond.wait(Lock);
+	auto header_size = get_size<foscam_api::Header>();
+	vector<uint8_t> message_buf(header_size + header.size);
+	write(boost::asio::buffer(message_buf), header);
+	write(boost::asio::buffer(message_buf) + header_size, request);
+
+	boost::asio::write(socket_, boost::asio::buffer(message_buf));
+
+	video_on_reply_cond_.wait(lock);
 
 	return true;
 }
 
 bool Foscam::AudioOn()
 {
-	unique_lock<mutex> Lock(mDataThreadMutex);
+	unique_lock<mutex> lock(reply_cond_mutex_);
 
-	AudioOnRequest Request(mstrUser, mstrPassword);
-	if(send(mSock, &Request, sizeof(Request), 0) < 0 )
-	{
-		throw FoscamException(string("Failed to send audio on request: ") + strerror(errno));
-	}
+  foscam_api::Header header;
+  header.type = Command::AUDIO_ON_REQUEST;
+  header.size = get_size<foscam_api::AudioOnRequest>();
+  foscam_api::AudioOnRequest request;
+  strncpy(request.username.str, user_.c_str(), request.username.size);
+  strncpy(request.password.str, password_.c_str(), request.password.size);
 
-	mAudioOnReplyCond.wait(Lock);
+  auto header_size = get_size<foscam_api::Header>();
+  vector<uint8_t> message_buf(header_size + header.size);
+  write(boost::asio::buffer(message_buf), header);
+  write(boost::asio::buffer(message_buf) + header_size, request);
+
+  boost::asio::write(socket_, boost::asio::buffer(message_buf));
+
+	audio_on_reply_cond_.wait(lock);
 
 	return true;
 }
 
-unsigned int Foscam::GetVideoDataAvailable()
+unsigned int Foscam::GetAvailableVideoStreamData()
 {
-	unique_lock<mutex> Lock(mDataThreadMutex);
-
-	return mVideoBuffer.size();
+	return video_stream_buffer_.read_available();
 }
 
-unsigned int Foscam::GetVideoData(uint8_t * in_pData, unsigned int in_unDataLength)
+unsigned int Foscam::GetVideoStreamData(uint8_t * in_pData, unsigned int in_unDataLength)
 {
-	unique_lock<mutex> Lock(mDataThreadMutex);
-
-	auto ReadSize = min(static_cast<unsigned int>(mVideoBuffer.size()), in_unDataLength);
-	for(unsigned int unDataIdx; unDataIdx < ReadSize; unDataIdx++)
-	{
-		*in_pData++ = mVideoBuffer.front();
-		mVideoBuffer.pop();
-	}
-
-	return ReadSize;
+	return video_stream_buffer_.pop(in_pData, in_unDataLength);
 }
 
-void Foscam::DataThread()
+void Foscam::do_read_header()
 {
-	while(!mfStartDataThread)
+	auto self(shared_from_this());
+	auto header_size = get_size<foscam_api::Header>();
+	auto header_buf = make_shared<vector<uint8_t> >(header_size);
+
+	boost::asio::async_read(socket_,
+			boost::asio::buffer(*header_buf),
+	        [this, self, header_buf](boost::system::error_code ec, std::size_t /*length*/)
+	        {
+            if (!ec)
+            {
+              foscam_api::Header header;
+              boost::asio::const_buffer buf_rest;
+              tie(header, buf_rest) = read<foscam_api::Header>(boost::asio::buffer(*header_buf));
+
+              do_handle_event(header);
+            }
+            else
+            {
+              socket_.close();
+            }
+	        });
+}
+
+void Foscam::do_handle_event(foscam_api::Header header)
+{
+	auto self(shared_from_this());
+
+	switch(header.type)
 	{
-		this_thread::sleep_for(chrono::milliseconds(100));
-	}
-
-	ofstream VideoFile("video_file");
-	ofstream AudioFile("audio_file");
-
-	while(!mfStopDataThread)
-	{
-		struct pollfd PollSock;
-		memset(&PollSock, 0, sizeof(PollSock));
-		PollSock.fd = mSock;
-		PollSock.events = POLLIN;
-
-		// Check for data to read
-		auto Ret = poll(&PollSock, 1, 100);
-		if(Ret < 0)
+		case Command::VIDEO_ON_REPLY:
 		{
-			throw FoscamException(string("Failed to poll socket: ") + strerror(errno));
-		}
+		  auto reply_buf = make_shared<vector<uint8_t> >(header.size);
 
-		// No data to read
-		if(!(PollSock.revents & POLLIN))
-		{
-			continue;
-		}
-
-		Header Event;
-		if(RevcLoop(mSock, &Event, sizeof(Event)) < 0 )
-		{
-			throw FoscamException(string("Failed to receive event header: ") + strerror(errno));
-		}
-		Event.Check();
-
-		switch(Event.Type)
-		{
-			case Command::VIDEO_ON_REPLY:
-			{
-				VideoOnReply Reply = Event;
-				Reply.CheckHeader();
-
-				if(RevcLoop(mSock, Reply.GetData(), Reply.un32Size) < 0 )
-				{
-					throw FoscamException(string("Failed to receive video on response: ") + strerror(errno));
-				}
-				Reply.CheckData();
-
-				mVideoOnReplyCond.notify_one();
-			} break;
-
-			case Command::AUDIO_ON_REPLY:
-			{
-				AudioOnReply Reply = Event;
-				Reply.CheckHeader();
-
-				if(RevcLoop(mSock, Reply.GetData(), Reply.un32Size) < 0 )
-				{
-					throw FoscamException(string("Failed to receive audio on response: ") + strerror(errno));
-				}
-				Reply.CheckData();
-
-				mAudioOnReplyCond.notify_one();
-			} break;
-
-			case Command::VIDEO_DATA:
-			{
-				vector<uint8_t> VideoData(Event.un32Size);
-				if(RevcLoop(mSock, VideoData.data(), Event.un32Size) < 0 )
-				{
-					throw FoscamException(string("Failed to receive video data: ") + strerror(errno));
-				}
-
-				{
-					unique_lock<mutex> Lock(mDataThreadMutex);
-					for(auto Data: VideoData)
+			boost::asio::async_read(socket_,
+					boost::asio::buffer(*reply_buf),
+					[this, self, header, reply_buf](boost::system::error_code ec, std::size_t /*length*/)
 					{
-						VideoFile.put(Data);
-						mVideoBuffer.push(Data);
-					}
-				}
-			} break;
+						if (!ec)
+						{
+						  foscam_api::VideoOnReply reply;
+						  boost::asio::const_buffer buf_rest;
+						  tie(reply, buf_rest) = read<foscam_api::VideoOnReply>(boost::asio::buffer(*reply_buf));
 
-			case Command::AUDIO_DATA:
-			{
-				AudioData AudioDataHeader = Event;
-				AudioDataHeader.CheckHeader();
+						  if(reply.failed)
+						  {
+						    throw FoscamException("Failed to enable video.");
+						  }
 
-				if(RevcLoop(mSock, AudioDataHeader.GetData(), AudioDataHeader.GetDataSize()) < 0 )
-				{
-					throw FoscamException(string("Failed to receive audio data header: ") + strerror(errno));
-				}
-				AudioDataHeader.CheckData();
+							video_on_reply_cond_.notify_one();
 
-				auto DataSize = AudioDataHeader.un32Size - AudioDataHeader.GetDataSize();
-				vector<char> AudioData(DataSize);
-				if(RevcLoop(mSock, AudioData.data(), DataSize) < 0 )
-				{
-					throw FoscamException(string("Failed to receive audio data: ") + strerror(errno));
-				}
+							// Ready for another event
+              do_read_header();
+						}
+						else
+						{
+							socket_.close();
+						}
+					});
+		} break;
 
-				{
-					unique_lock<mutex> Lock(mDataThreadMutex);
-					for(auto Data: AudioData)
+		case Command::AUDIO_ON_REPLY:
+		{
+		  auto reply_buf = make_shared<vector<uint8_t> >(header.size);
+
+			boost::asio::async_read(socket_,
+          boost::asio::buffer(*reply_buf),
+          [this, self, header, reply_buf](boost::system::error_code ec, std::size_t /*length*/)
+          {
+            if (!ec)
+            {
+              foscam_api::AudioOnReply reply;
+              boost::asio::const_buffer buf_rest;
+              tie(reply, buf_rest) = read<foscam_api::AudioOnReply>(boost::asio::buffer(*reply_buf));
+
+              if(reply.failed)
+              {
+                throw FoscamException("Failed to enable video.");
+              }
+
+              audio_on_reply_cond_.notify_one();
+
+              // Ready for another event
+              do_read_header();
+            }
+            else
+            {
+              socket_.close();
+            }
+          });
+		} break;
+
+		case Command::VIDEO_DATA:
+		{
+		  auto video_data_buf = make_shared<vector<uint8_t> >(header.size);
+
+			boost::asio::async_read(socket_,
+					boost::asio::buffer(*video_data_buf),
+					[this, self, video_data_buf](boost::system::error_code ec, std::size_t /*length*/)
 					{
-						AudioFile.put(Data);
-						mAudioBuffer.push(Data);
-					}
-				}
-			} break;
+						if (!ec)
+						{
+							video_buffer_.push(video_data_buf->data(), video_data_buf->size());
 
-			default:
-			{
-				cerr << "Unknown header received: " << hex << static_cast<unsigned int>(Event.Type) << endl;
-				continue;
-			}
+              // Ready for another event
+              do_read_header();
+						}
+						else
+						{
+							socket_.close();
+						}
+					});
+		} break;
+
+		case Command::AUDIO_DATA:
+		{
+		  auto audio_data_header_buf = make_shared<vector<uint8_t> >(get_size<foscam_api::AudioDataHeader>());
+		  size_t audio_data_size = header.size - audio_data_header_buf->size();
+
+			boost::asio::async_read(socket_,
+					boost::asio::buffer(*audio_data_header_buf),
+					[this, self, audio_data_header_buf, audio_data_size](boost::system::error_code ec, std::size_t /*length*/)
+					{
+						if (!ec)
+						{
+						  foscam_api::AudioDataHeader audio_data_header;
+              boost::asio::const_buffer buf_rest;
+              tie(audio_data_header, buf_rest) = read<foscam_api::AudioDataHeader>(boost::asio::buffer(*audio_data_header_buf));
+
+              auto audio_data_buf = make_shared<vector<uint8_t> >(audio_data_size);
+							boost::asio::async_read(socket_,
+									boost::asio::buffer(*audio_data_buf),
+									[this, self, audio_data_buf](boost::system::error_code ec, std::size_t /*length*/)
+									{
+										if (!ec)
+										{
+											audio_buffer_.push(audio_data_buf->data(), audio_data_buf->size());
+
+				              // Ready for another event
+				              do_read_header();
+										}
+										else
+										{
+											socket_.close();
+										}
+									});
+						}
+						else
+						{
+							socket_.close();
+						}
+					});
+		} break;
+
+		default:
+		{
+			cerr << "Unknown header received: " << hex << static_cast<unsigned int>(header.type) << endl;
 		}
 	}
 }

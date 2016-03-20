@@ -1,5 +1,5 @@
 project(foscam_hd)
-cmake_minimum_required(VERSION 2.8.11)
+cmake_minimum_required(VERSION 2.8)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -ggdb -Wall -std=c++14")
 
@@ -7,24 +7,27 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -ggdb -Wall -std=c++14")
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules)
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
-set(CMAKE_AUTOMOC ON)
-set(QT_USE_PHONON TRUE)
 
-find_package(Qt5Widgets)
-find_package(Qt5Multimedia)
-find_package(Qt5MultimediaWidgets)
-set(LIBS ${LIBS} pthread Qt5::Widgets Qt5::Multimedia Qt5::MultimediaWidgets)
+find_package(Boost REQUIRED system)
+include_directories(${Boost_INCLUDE_DIRS})
+link_directories(${Boost_LIBRARY_DIRS})
+set(LIBS ${LIBS} ${Boost_LIBRARIES})
 
 find_package(FFmpeg REQUIRED)
 include_directories(${FFMPEG_INCLUDE_DIR})
 set(LIBS ${LIBS} ${FFMPEG_LIBRARIES})
 
+find_package(MHD REQUIRED)
+include_directories(${MHD_INCLUDE_DIRS})
+set(LIBS ${LIBS} ${MHD_LIBRARIES})
+
 file(GLOB FOSCAM_HD_SOURCE *.h *.cpp)
-file(GLOB FOSCAM_HD_UI *.ui)
+set(LIBS ${LIBS} pthread)
 
-qt5_wrap_ui(FOSCAM_HD_UI_HDRS ${FOSCAM_HD_UI})
-
-add_library(foscam_hd_generated_ui STATIC ${FOSCAM_HD_UI_HDRS})
 add_executable(foscam_hd ${FOSCAM_HD_SOURCE})
+target_link_libraries(foscam_hd ${LIBS})
 
-target_link_libraries(foscam_hd foscam_hd_generated_ui ${LIBS})
+add_custom_command(TARGET foscam_hd POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/favicon.ico $<TARGET_FILE_DIR:foscam_hd>)
+add_custom_command(TARGET foscam_hd POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/video_player.html $<TARGET_FILE_DIR:foscam_hd>)

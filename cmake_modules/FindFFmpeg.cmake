@@ -8,10 +8,10 @@
 #  FFMPEG_LIBRARIES		- link these to use FFMPEG
 #
 
-SET(FFMPEG_HEADERS libavformat/avformat.h libavcodec/avcodec.h libavutil/avutil.h libavfilter/avfilter.h libavdevice/avdevice.h libswscale/swscale.h)
+SET(FFMPEG_HEADERS libavformat/avformat.h libavcodec/avcodec.h libavutil/avutil.h libavfilter/avfilter.h libavdevice/avdevice.h libswscale/swscale.h libswresample/swresample.h)
 
 IF(WIN32)
-	SET(FFMPEG_LIBRARIES libavformat.dll.a libavcodec.dll.a libavutil.dll.a libavfilter.dll.a libavdevice.dll.a libswscale.dll.a)
+	SET(FFMPEG_LIBRARIES libavformat.dll.a libavcodec.dll.a libavutil.dll.a libavfilter.dll.a libavdevice.dll.a libswscale.dll.a libswresample.dll.a)
 	SET(FFMPEG_LIBRARY_DIR $ENV{FFMPEGDIR}\\lib CACHE PATH "Location of the AV libraries")
 	SET(FFMPEG_INCLUDE_PATHS $ENV{FFMPEGDIR}\\include CACHE PATH "Location of the AV library headers")
 ELSE()
@@ -23,6 +23,7 @@ ELSE()
 		PKG_CHECK_MODULES(AVFILTER libavfilter)
 		PKG_CHECK_MODULES(AVDEVICE libavdevice)
 		PKG_CHECK_MODULES(SWSCALE libswscale)
+		PKG_CHECK_MODULES(SWRESAMPLE libswresample)
 	ENDIF()
 
 	SET(FFMPEG_LIBRARY_DIR ${AVFORMAT_LIBRARY_DIRS}
@@ -30,18 +31,20 @@ ELSE()
 			     ${AVUTIL_LIBRARY_DIRS}
 			     ${AVFILTER_LIBRARY_DIRS}
 			     ${AVDEVICE_LIBRARY_DIRS}
-			     ${SWSCALE_LIBRARY_DIRS})
+			     ${SWSCALE_LIBRARY_DIRS}
+			     ${SWRESAMPLE_LIBRARY_DIRS})
 	SET(FFMPEG_INCLUDE_PATHS ${AVFORMAT_INCLUDE_DIRS}
 			     ${AVCODEC_INCLUDE_DIRS}
 			     ${AVUTIL_INCLUDE_DIRS}
 			     ${AVFILTER_INCLUDE_DIRS}
 			     ${AVDEVICE_INCLUDE_DIRS}
-			     ${SWSCALE_INCLUDE_DIRS})
+			     ${SWSCALE_INCLUDE_DIRS}
+			     ${SWRESAMPLE_INCLUDE_DIRS})
 
 	IF(NOT APPLE)
-		SET(FFMPEG_LIBRARIES avformat avcodec avutil avfilter avdevice swscale)
+		SET(FFMPEG_LIBRARIES avformat avcodec avutil avfilter avdevice swscale swresample)
 	ELSE()
-		SET(FFMPEG_LIBRARIES libavformat.a libavcodec.a libavutil.a libavfilter.a libavdevice.a libswscale.a bz2)
+		SET(FFMPEG_LIBRARIES libavformat.a libavcodec.a libavutil.a libavfilter.a libavdevice.a libswscale.a libswresample.a bz2)
 	ENDIF()
 ENDIF()
 

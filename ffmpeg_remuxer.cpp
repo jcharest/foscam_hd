@@ -1,10 +1,9 @@
 #include <iostream>
+#include <cstdlib>
+#include <boost/shared_array.hpp>
 
 extern "C" {
 #include <libavutil/opt.h>
-#include <libavfilter/avfilter.h>
-#include <libavfilter/buffersrc.h>
-#include <libavfilter/buffersink.h>
 }
 
 #include "ffmpeg_remuxer.h"
@@ -14,7 +13,7 @@ using namespace std;
 static const size_t VIDEO_BUFFER_SIZE = 4 * 1024;
 static const size_t VIDEO_PROBE_SIZE = 256 * 1024;
 
-static const size_t AUDIO_BUFFER_SIZE = 1 * 1024;
+static const size_t AUDIO_BUFFER_SIZE = 4 * 1024;
 
 
 FFMpegRemuxerException::FFMpegRemuxerException(const std::string & in_strWhat) : mstrWhat(in_strWhat)
@@ -26,11 +25,13 @@ const char* FFMpegRemuxerException::what() const noexcept
 	return ("FFMpegRemuxerException" + mstrWhat).c_str();
 }
 
-FFMpegRemuxer::FFMpegRemuxer(unique_ptr<DataFunctor> && in_VideoFunc, unique_ptr<DataFunctor> && in_AudioFunc, Framerate in_Framerate)
- : mFramerate(in_Framerate), mfStartThread(false),
+FFMpegRemuxer::FFMpegRemuxer(unique_ptr<InDataFunctor> && in_VideoFunc, unique_ptr<InDataFunctor> && in_AudioFunc,
+		unique_ptr<OutStreamFunctor> && in_OutStreamFunc, double in_dFramerate)
+ : mdFramerate(in_dFramerate), mfStartThread(false),
    mfStopThread(false), mThread(&FFMpegRemuxer::ThreadRun, this),
    mVideoInputStream(VIDEO_BUFFER_SIZE, move(in_VideoFunc)),
-   mAudioInputStream(AUDIO_BUFFER_SIZE, move(in_AudioFunc))
+   mAudioInputStream(AUDIO_BUFFER_SIZE, move(in_AudioFunc)),
+   mOutputStream(VIDEO_BUFFER_SIZE, move(in_OutStreamFunc))
 {
     mfStartThread = true;
 }
@@ -44,16 +45,15 @@ FFMpegRemuxer::~FFMpegRemuxer()
 FFMpegRemuxer::Registrator::Registrator()
 {
 	av_register_all();
-	avfilter_register_all();
 }
 
 static int ReadData(void * in_pvOpaque, uint8_t * out_aun8Buffer, int in_nBufferSize)
 {
-	DataFunctor * pFunc = reinterpret_cast<DataFunctor *>(in_pvOpaque);
+	InDataFunctor * pFunc = reinterpret_cast<InDataFunctor *>(in_pvOpaque);
 	return (*pFunc)(out_aun8Buffer, in_nBufferSize);
 }
 
-FFMpegRemuxer::InputStreamContext::InputStreamContext(size_t in_BufferSize, std::unique_ptr<DataFunctor> && in_DataFunc)
+FFMpegRemuxer::InputStreamContext::InputStreamContext(size_t in_BufferSize, std::unique_ptr<InDataFunctor> && in_DataFunc)
  : pAVFormat(nullptr), pAVAvio(nullptr), mDataFunc(move(in_DataFunc))
 {
 	try
@@ -102,8 +102,8 @@ void FFMpegRemuxer::InputStreamContext::Release()
 	}
 }
 
-FFMpegRemuxer::AudioInputStreamContext::AudioInputStreamContext(size_t in_BufferSize, std::unique_ptr<DataFunctor> && in_DataFunc)
- : FFMpegRemuxer::InputStreamContext(in_BufferSize, move(in_DataFunc)), pBufferSink(nullptr), pBufferSrc(nullptr), pFilterGraph(nullptr)
+FFMpegRemuxer::AudioInputStreamContext::AudioInputStreamContext(size_t in_BufferSize, std::unique_ptr<InDataFunctor> && in_DataFunc)
+ : FFMpegRemuxer::InputStreamContext(in_BufferSize, move(in_DataFunc)), pAudioResampler(nullptr), pAudioFifo(nullptr)
 {
 }
 
@@ -113,28 +113,36 @@ FFMpegRemuxer::AudioInputStreamContext::~AudioInputStreamContext()
 
 void FFMpegRemuxer::AudioInputStreamContext::Release()
 {
-	avfilter_graph_free(&pFilterGraph);
+	swr_free(&pAudioResampler);
+	av_audio_fifo_free(pAudioFifo);
 }
 
-FFMpegRemuxer::OutputStreamContext::OutputStreamContext()
- : pAVFormat(nullptr), pVideoStream(nullptr), pAudioStream(nullptr)
+static int WriteData(void * in_pvOpaque, uint8_t * in_aun8Buffer, int in_nBufferSize)
 {
-	avformat_alloc_output_context2(&pAVFormat, NULL, NULL, "test.mkv");
+	OutStreamFunctor * pFunc = reinterpret_cast<OutStreamFunctor *>(in_pvOpaque);
+	return (*pFunc)(in_aun8Buffer, in_nBufferSize);
+}
+
+FFMpegRemuxer::OutputStreamContext::OutputStreamContext(size_t in_BufferSize, unique_ptr<OutStreamFunctor> && in_StreamFunc)
+ : pAVFormat(nullptr), pAVAvio(nullptr), pVideoStream(nullptr), pAudioStream(nullptr), mStreamFunc(move(in_StreamFunc))
+{
+	avformat_alloc_output_context2(&pAVFormat, NULL, NULL, "test.mp4");
 	if(!pAVFormat)
 	{
 		throw FFMpegRemuxerException("Failed to allocate avformat context");
 	}
 
-	// Set fragmented mp4 options
-	av_opt_set(pAVFormat, "movflags", "+empty_moov", 0);
-	av_opt_set(pAVFormat, "movflags", "+frag_keyframe", 0);
-
-	auto Ret = avio_open(&pAVFormat->pb, "test.mkv", AVIO_FLAG_WRITE);
-	if(Ret < 0)
+	uint8_t * pAVBuffer = reinterpret_cast<uint8_t *>(av_malloc(in_BufferSize));
+	if(!pAVBuffer)
 	{
-		Release();
-		throw FFMpegRemuxerException("Failed to open output file");
+		throw FFMpegRemuxerException("Failed to allocate avformat buffer");
 	}
+	pAVAvio = avio_alloc_context(pAVBuffer, in_BufferSize, 1, mStreamFunc.get(), nullptr, WriteData, nullptr);
+	if(!pAVAvio)
+	{
+		throw FFMpegRemuxerException("Failed to allocate avformat avio context");
+	}
+	pAVFormat->pb = pAVAvio;
 }
 
 FFMpegRemuxer::OutputStreamContext::~OutputStreamContext()
@@ -144,10 +152,12 @@ FFMpegRemuxer::OutputStreamContext::~OutputStreamContext()
 
 void FFMpegRemuxer::OutputStreamContext::Release()
 {
-	if(pAVFormat)
+	avformat_free_context(pAVFormat);
+
+	if(pAVAvio)
 	{
-		avio_closep(&pAVFormat->pb);
-		avformat_free_context(pAVFormat);
+		av_freep(&pAVAvio->buffer);
+		av_freep(&pAVAvio);
 	}
 }
 
@@ -169,7 +179,7 @@ void FFMpegRemuxer::ThreadRun()
 		if(fOutputHeaderWritten)
 		{
 			RemuxVideoPacket(mVideoInputStream);
-			TranscodeAudioPacketFilter(mAudioInputStream);
+			TranscodeAudioPacket(mAudioInputStream);
 		}
 		else
 		{
@@ -178,7 +188,11 @@ void FFMpegRemuxer::ThreadRun()
 				CreateVideoStream(mVideoInputStream);
 				CreateAudioStream(mAudioInputStream);
 
-				auto Ret = avformat_write_header(mOutputStream.pAVFormat, nullptr);
+				// Set fragmented mp4 options
+				AVDictionary * Flags = nullptr;
+				av_dict_set(&Flags, "movflags", "empty_moov+default_base_moof+frag_keyframe", 0);
+
+				auto Ret = avformat_write_header(mOutputStream.pAVFormat, &Flags);
 				if(Ret < 0)
 				{
 					throw FFMpegRemuxerException("Failed to write header");
@@ -199,6 +213,7 @@ void FFMpegRemuxer::CreateVideoStream(InputStreamContext & io_pInputStream)
 	AVInputFormat * pformat = av_find_input_format("h264");
 	AVDictionary * Options = nullptr;
 	av_dict_set_int(&Options, "probesize2", VIDEO_PROBE_SIZE, 0);
+	av_dict_set(&Options, "framerate", to_string(mdFramerate).c_str(), 0);
 
 	auto Ret = avformat_open_input(&io_pInputStream.pAVFormat, nullptr, pformat, &Options);
 	if(Ret < 0)
@@ -213,10 +228,6 @@ void FFMpegRemuxer::CreateVideoStream(InputStreamContext & io_pInputStream)
 	}
 
 	AVStream * pInStream = io_pInputStream.pAVFormat->streams[0];
-	pInStream->skip_to_keyframe = true;
-	pInStream->codec->time_base.num = mFramerate.nNum;
-	pInStream->codec->time_base.den = mFramerate.nDen;
-
 	av_dump_format(io_pInputStream.pAVFormat, 0, "Video", 0);
 
 	// Create output stream
@@ -233,112 +244,7 @@ void FFMpegRemuxer::CreateVideoStream(InputStreamContext & io_pInputStream)
 	}
 
 	mOutputStream.pVideoStream->codec->codec_tag = 0;
-	mOutputStream.pVideoStream->time_base = pInStream->time_base;
-}
-
-void FFMpegRemuxer::CreateAudioStreamFilter(AudioInputStreamContext & io_pInputStream)
-{
-	struct AVFilterInOutDeleter {
-		void operator()(AVFilterInOut * p) {
-			if(p)
-			{
-				avfilter_inout_free(&p);
-			}
-		}
-	};
-	unique_ptr<AVFilterInOut, AVFilterInOutDeleter> ptrOutput(avfilter_inout_alloc());
-	unique_ptr<AVFilterInOut, AVFilterInOutDeleter> ptrInput(avfilter_inout_alloc());
-	if(ptrOutput == nullptr || ptrInput == nullptr)
-	{
-		throw FFMpegRemuxerException("Failed to allocate filter inouts");
-	}
-
-	io_pInputStream.pFilterGraph = avfilter_graph_alloc();
-	if(io_pInputStream.pFilterGraph == nullptr)
-	{
-		throw FFMpegRemuxerException("Failed to allocate filter graph");
-	}
-
-	auto BufferSrc = avfilter_get_by_name("abuffer");
-	auto BufferSink = avfilter_get_by_name("abuffersink");
-	if(BufferSrc == nullptr || BufferSink == nullptr)
-	{
-		throw FFMpegRemuxerException("Filtering source or sink element not found");
-	}
-
-	AVStream * pInStream = io_pInputStream.pAVFormat->streams[0];
-
-	char szArgs[512];
-	snprintf(szArgs, sizeof(szArgs),
-			"time_base=%d/%d:sample_rate=%d:sample_fmt=%s:channel_layout=0x%" PRIx64,
-			pInStream->codec->time_base.num, pInStream->codec->time_base.den,
-			pInStream->codec->sample_rate,
-			av_get_sample_fmt_name(pInStream->codec->sample_fmt),
-			pInStream->codec->channel_layout);
-
-	auto Ret = avfilter_graph_create_filter(&io_pInputStream.pBufferSrc, BufferSrc, "in",
-			szArgs, NULL, io_pInputStream.pFilterGraph);
-	if(Ret < 0)
-	{
-		throw FFMpegRemuxerException("Cannot create audio buffer source");
-	}
-	Ret = avfilter_graph_create_filter(&io_pInputStream.pBufferSink, BufferSink, "out",
-			NULL, NULL, io_pInputStream.pFilterGraph);
-	if(Ret < 0)
-	{
-		throw FFMpegRemuxerException("Cannot create audio buffer sink");
-	}
-
-	Ret = av_opt_set_bin(io_pInputStream.pBufferSink, "sample_fmts",
-			(uint8_t*)&mOutputStream.pAudioStream->codec->sample_fmt,
-			sizeof(mOutputStream.pAudioStream->codec->sample_fmt), AV_OPT_SEARCH_CHILDREN);
-	if(Ret < 0)
-	{
-		throw FFMpegRemuxerException("Cannot set output sample format");
-	}
-	Ret = av_opt_set_bin(io_pInputStream.pBufferSink, "channel_layouts",
-			(uint8_t*)&mOutputStream.pAudioStream->codec->channel_layout,
-			sizeof(mOutputStream.pAudioStream->codec->channel_layout), AV_OPT_SEARCH_CHILDREN);
-	if(Ret < 0)
-	{
-		throw FFMpegRemuxerException("Cannot set output channel layout");
-	}
-	Ret = av_opt_set_bin(io_pInputStream.pBufferSink, "sample_rates",
-			(uint8_t*)&mOutputStream.pAudioStream->codec->sample_rate,
-			sizeof(mOutputStream.pAudioStream->codec->sample_rate),	AV_OPT_SEARCH_CHILDREN);
-	if(Ret < 0)
-	{
-		throw FFMpegRemuxerException("Cannot set output sample rate");
-	}
-
-	ptrOutput->name       = av_strdup("in");
-	ptrOutput->filter_ctx = io_pInputStream.pBufferSrc;
-	ptrOutput->pad_idx    = 0;
-	ptrOutput->next       = NULL;
-	ptrInput->name       = av_strdup("out");
-	ptrInput->filter_ctx = io_pInputStream.pBufferSink;
-	ptrInput->pad_idx    = 0;
-	ptrInput->next       = NULL;
-	if(ptrOutput->name == nullptr || ptrInput->name == nullptr)
-	{
-		throw FFMpegRemuxerException("Cannot dup name strings");
-	}
-
-	AVFilterInOut * pOutput = ptrOutput.get();
-	AVFilterInOut * pInput = ptrInput.get();
-	Ret = avfilter_graph_parse_ptr(io_pInputStream.pFilterGraph, "anull", &pInput, &pOutput, nullptr);
-	if(Ret < 0)
-	{
-		throw FFMpegRemuxerException("Failed to parse filter graph");
-	}
-	ptrOutput.release();
-	ptrInput.release();
-
-	Ret = avfilter_graph_config(io_pInputStream.pFilterGraph, nullptr);
-	if(Ret < 0)
-	{
-		throw FFMpegRemuxerException("Failed to configure filter graph");
-	}
+	mOutputStream.pVideoStream->time_base = pInStream->codec->time_base;
 }
 
 void FFMpegRemuxer::CreateAudioStream(AudioInputStreamContext & io_pInputStream)
@@ -362,7 +268,7 @@ void FFMpegRemuxer::CreateAudioStream(AudioInputStreamContext & io_pInputStream)
 	// Open decoder
 	pInStream->codec->sample_rate = 8000;
 	pInStream->codec->channels = 1;
-	pInStream->codec->channel_layout = AV_CH_LAYOUT_MONO;
+	pInStream->codec->channel_layout = av_get_default_channel_layout(pInStream->codec->channels);
 	Ret = avcodec_open2(pInStream->codec, avcodec_find_decoder(pInStream->codec->codec_id), nullptr);
 	if(Ret < 0)
 	{
@@ -379,149 +285,212 @@ void FFMpegRemuxer::CreateAudioStream(AudioInputStreamContext & io_pInputStream)
 	}
 
 	mOutputStream.pAudioStream->time_base = pInStream->time_base;
-	mOutputStream.pAudioStream->codec->sample_rate = 8000;
+	mOutputStream.pAudioStream->codec->sample_rate = pInStream->codec->sample_rate;
 	mOutputStream.pAudioStream->codec->sample_fmt = AV_SAMPLE_FMT_FLT;
-	mOutputStream.pAudioStream->codec->channels = 1;
-	mOutputStream.pAudioStream->codec->channel_layout = AV_CH_LAYOUT_MONO;
+	mOutputStream.pAudioStream->codec->channels = pInStream->codec->channels;
+	mOutputStream.pAudioStream->codec->channel_layout = pInStream->codec->channel_layout;
 	Ret = avcodec_open2(mOutputStream.pAudioStream->codec, avcodec_find_encoder(AV_CODEC_ID_AC3), nullptr);
 	if(Ret < 0)
 	{
 		throw FFMpegRemuxerException("Failed to open encoder");
 	}
 
-	CreateAudioStreamFilter(io_pInputStream);
+	io_pInputStream.pAudioResampler = swr_alloc_set_opts(nullptr,
+			mOutputStream.pAudioStream->codec->channel_layout,
+			mOutputStream.pAudioStream->codec->sample_fmt,
+			mOutputStream.pAudioStream->codec->sample_rate,
+			pInStream->codec->channel_layout,
+			pInStream->codec->sample_fmt,
+			pInStream->codec->sample_rate,
+			0, nullptr);
+	if(io_pInputStream.pAudioResampler == nullptr)
+	{
+		throw FFMpegRemuxerException("Failed to allocate resampler");
+	}
+
+	Ret = swr_init(io_pInputStream.pAudioResampler);
+	if(Ret < 0)
+	{
+		throw FFMpegRemuxerException("Failed to initialize resampler");
+	}
+
+	io_pInputStream.pAudioFifo = av_audio_fifo_alloc(
+			mOutputStream.pAudioStream->codec->sample_fmt, mOutputStream.pAudioStream->codec->channels, 1);
+	if(io_pInputStream.pAudioFifo == nullptr)
+	{
+		throw FFMpegRemuxerException("Failed to allocate fifo");
+	}
 }
+
+struct CAVPacket : public AVPacket
+{
+	CAVPacket()
+	{
+		av_init_packet(this);
+		data = nullptr;
+		size = 0;
+	}
+
+	~CAVPacket()
+	{
+		av_packet_unref(this);
+	}
+};
 
 void FFMpegRemuxer::RemuxVideoPacket(InputStreamContext & io_pInputStream)
 {
-	AVStream * pInStream = io_pInputStream.pAVFormat->streams[0];
-
-	AVPacket Pkt;
+	CAVPacket Pkt;
 	auto Ret = av_read_frame(io_pInputStream.pAVFormat, &Pkt);
 	if (Ret < 0)
 	{
 		return;
 	}
 
-	av_packet_rescale_ts(&Pkt, pInStream->codec->time_base, mOutputStream.pVideoStream->time_base);
+	av_packet_rescale_ts(&Pkt,
+			io_pInputStream.pAVFormat->streams[0]->time_base,
+			mOutputStream.pVideoStream->time_base);
 	Pkt.stream_index = mOutputStream.pVideoStream->index;
 
 	Ret = av_interleaved_write_frame(mOutputStream.pAVFormat, &Pkt);
 	if (Ret < 0)
 	{
-		av_free_packet(&Pkt);
 		throw FFMpegRemuxerException("Failed to remux packet");
 	}
-
-	av_free_packet(&Pkt);
 }
 
-void FFMpegRemuxer::TranscodeAudioPacketFilter(AudioInputStreamContext & io_pInputStream)
+struct AVInputSamplesDeleter {
+	void operator()(uint8_t ** p)
+	{
+		if(p)
+		{
+			if(&p[0])
+			{
+				av_freep(&p[0]);
+			}
+
+			free(p);
+		}
+	}
+};
+typedef unique_ptr<uint8_t *, AVInputSamplesDeleter> AVInputSamplesPtr;
+
+void FFMpegRemuxer::TranscodeAudioPacket(AudioInputStreamContext & io_pInputStream)
 {
-	AVStream * pInStream = io_pInputStream.pAVFormat->streams[0];
-
-	AVPacket DecPkt;
-	memset(&DecPkt, 0, sizeof(DecPkt));
-
+	// Read packet
+	CAVPacket DecPkt;
 	auto Ret = av_read_frame(io_pInputStream.pAVFormat, &DecPkt);
 	if (Ret < 0)
 	{
 		return;
 	}
 
-	AVFramePtr pFrame(av_frame_alloc());
-	if(pFrame == nullptr)
+	// Decode
+	AVFramePtr ptrInputFrame(av_frame_alloc());
+	if(ptrInputFrame == nullptr)
 	{
 		throw FFMpegRemuxerException("Failed to allocate frame");
 	}
-	AVFramePtr pFiltFrame;
-
-	try
+	int nGotFrame = 0;
+	Ret = avcodec_decode_audio4(io_pInputStream.pAVFormat->streams[0]->codec, ptrInputFrame.get(), &nGotFrame, &DecPkt);
+	if (Ret < 0)
 	{
-		int nGotFrame;
-		Ret = avcodec_decode_audio4(pInStream->codec, pFrame.get(), &nGotFrame, &DecPkt);
-		if (Ret < 0)
-		{
-			char szError[AV_ERROR_MAX_STRING_SIZE];
-			av_strerror(Ret, szError, AV_ERROR_MAX_STRING_SIZE);
-			throw FFMpegRemuxerException(string("Failed to decode frame: ") + szError);
-		}
-		if(nGotFrame)
-		{
-			auto Ret = av_buffersrc_add_frame_flags(io_pInputStream.pBufferSrc, pFrame.get(), 0);
-			if(Ret < 0)
-			{
-				throw FFMpegRemuxerException("Error while feeding the filtergraph");
-			}
-
-			while(true)
-			{
-				pFiltFrame.reset(av_frame_alloc());
-				if(pFiltFrame == nullptr)
-				{
-					throw FFMpegRemuxerException("Failed to allocate frame");
-				}
-
-				Ret = av_buffersink_get_frame(io_pInputStream.pBufferSink, pFiltFrame.get());
-				if(Ret < 0)
-				{
-					if (Ret != AVERROR(EAGAIN) && Ret != AVERROR_EOF)
-					{
-						throw FFMpegRemuxerException("Error while reading the filtergraph");
-					}
-
-					break;
-				}
-
-				pFiltFrame->pict_type = AV_PICTURE_TYPE_NONE;
-				TranscodeAudioPacket(io_pInputStream, pFiltFrame);
-			}
-		}
+		char szError[AV_ERROR_MAX_STRING_SIZE];
+		av_strerror(Ret, szError, AV_ERROR_MAX_STRING_SIZE);
+		throw FFMpegRemuxerException(string("Failed to decode frame: ") + szError);
 	}
-	catch(exception & Ex)
+	if(!nGotFrame)
 	{
-		av_free_packet(&DecPkt);
-		throw Ex;
+		return;
 	}
 
-	av_free_packet(&DecPkt);
-}
+	// Allocate Input samples
+	int nOutputChannels = mOutputStream.pAudioStream->codec->channels;
 
-void FFMpegRemuxer::TranscodeAudioPacket(AudioInputStreamContext & io_pInputStream, AVFramePtr & in_ptrFrame)
-{
-	AVPacket EncPkt;
-	memset(&EncPkt, 0, sizeof(EncPkt));
-
-	try
+	AVInputSamplesPtr ptrInputSamples;
+	ptrInputSamples.reset(reinterpret_cast<AVInputSamplesPtr::element_type *>(calloc(nOutputChannels, sizeof(*ptrInputSamples.get()))));
+	if(!ptrInputSamples)
 	{
-		av_init_packet(&EncPkt);
-		int nGotPacket;
-		auto Ret = avcodec_encode_audio2(mOutputStream.pAudioStream->codec, &EncPkt, in_ptrFrame.get(), &nGotPacket);
-		if (Ret < 0)
-		{
-			char szError[AV_ERROR_MAX_STRING_SIZE];
-			av_strerror(Ret, szError, AV_ERROR_MAX_STRING_SIZE);
-			throw FFMpegRemuxerException(string("Failed to encode packet") + szError);
-		}
-		if(nGotPacket)
-		{
-			EncPkt.stream_index = mOutputStream.pAudioStream->index;
-			av_packet_rescale_ts(&EncPkt, mOutputStream.pAudioStream->codec->time_base, mOutputStream.pAudioStream->time_base);
-
-			Ret = av_interleaved_write_frame(mOutputStream.pAVFormat, &EncPkt);
-			if (Ret < 0)
-			{
-				char szError[AV_ERROR_MAX_STRING_SIZE];
-				av_strerror(Ret, szError, AV_ERROR_MAX_STRING_SIZE);
-				throw FFMpegRemuxerException(string("Failed to mux packet") + szError);
-			}
-		}
-	}
-	catch(exception & Ex)
-	{
-		av_free_packet(&EncPkt);
-		throw Ex;
+		throw FFMpegRemuxerException("Failed to allocate converted input sample pointers");
 	}
 
-	av_free_packet(&EncPkt);
+	int nFrameSize = ptrInputFrame->nb_samples;
+	Ret = av_samples_alloc(ptrInputSamples.get(), nullptr, nOutputChannels, nFrameSize,
+			mOutputStream.pAudioStream->codec->sample_fmt, 0);
+	if(Ret < 0)
+	{
+		throw FFMpegRemuxerException("Failed to allocate converted input samples");
+	}
+
+	Ret = swr_convert(io_pInputStream.pAudioResampler, ptrInputSamples.get(), nFrameSize,
+			const_cast<const uint8_t**>(ptrInputFrame->extended_data), nFrameSize);
+	if(Ret < 0)
+	{
+		throw FFMpegRemuxerException("Failed to convert input samples");
+	}
+
+	Ret = av_audio_fifo_realloc(io_pInputStream.pAudioFifo, av_audio_fifo_size(io_pInputStream.pAudioFifo) + nFrameSize);
+	if(Ret < 0)
+	{
+		throw FFMpegRemuxerException("Failed to reallocate FIFO");
+	}
+
+	Ret = av_audio_fifo_write(io_pInputStream.pAudioFifo, reinterpret_cast<void **>(ptrInputSamples.get()), nFrameSize);
+	if(Ret < nFrameSize)
+	{
+		throw FFMpegRemuxerException("Failed to write data to FIFO");
+	}
+
+	int nOutputFrameSize = mOutputStream.pAudioStream->codec->frame_size;
+	if(av_audio_fifo_size(io_pInputStream.pAudioFifo) < nOutputFrameSize)
+	{
+		return;
+	}
+
+	AVFramePtr ptrOutputFrame(av_frame_alloc());
+	if(ptrOutputFrame == nullptr)
+	{
+		throw FFMpegRemuxerException("Failed to allocate frame");
+	}
+
+	ptrOutputFrame->nb_samples     = nOutputFrameSize;
+	ptrOutputFrame->channel_layout = mOutputStream.pAudioStream->codec->channel_layout;
+	ptrOutputFrame->format         = mOutputStream.pAudioStream->codec->sample_fmt;
+	ptrOutputFrame->sample_rate    = mOutputStream.pAudioStream->codec->sample_rate;
+
+	Ret = av_frame_get_buffer(ptrOutputFrame.get(), 0);
+	if(Ret < 0)
+	{
+		throw FFMpegRemuxerException("Failed to allocate output frame samples");
+	}
+
+	Ret = av_audio_fifo_read(io_pInputStream.pAudioFifo, reinterpret_cast<void **>(ptrOutputFrame->data), nOutputFrameSize);
+	if(Ret < nOutputFrameSize)
+	{
+		throw FFMpegRemuxerException("Failed to read data from FIFO");
+	}
+
+	CAVPacket EncPkt;
+	nGotFrame = 0;
+	Ret = avcodec_encode_audio2(mOutputStream.pAudioStream->codec, &EncPkt,
+			ptrOutputFrame.get(), &nGotFrame);
+	if(Ret < 0)
+	{
+		throw FFMpegRemuxerException("Failed to encode frame");
+	}
+
+	if(!nGotFrame)
+	{
+		return;
+	}
+
+	av_packet_rescale_ts(&EncPkt,
+			io_pInputStream.pAVFormat->streams[0]->time_base,
+			mOutputStream.pAudioStream->time_base);
+	EncPkt.stream_index = mOutputStream.pAudioStream->index;
+
+	Ret = av_interleaved_write_frame(mOutputStream.pAVFormat, &EncPkt);
+	if (Ret < 0)
+	{
+		throw FFMpegRemuxerException("Failed to remux packet");
+	}
 }

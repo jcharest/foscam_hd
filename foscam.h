@@ -2,55 +2,63 @@
 #define FOSCAM_H
 
 #include <string>
-#include <atomic>
 #include <mutex>
 #include <condition_variable>
-#include <thread>
-#include <queue>
 #include <ffmpeg_remuxer.h>
 #include <ip_cam.h>
 
-class FoscamException : std::exception
+#include <boost/asio.hpp>
+#include <boost/lockfree/spsc_queue.hpp>
+
+class FoscamException : public std::exception
 {
 public:
 	FoscamException(const std::string & in_strWhat);
 
-	virtual const char* what() const noexcept;
+	virtual const char* what() const noexcept override;
 
 private:
 	std::string mstrWhat;
 };
 
-class Foscam : public IPCam
+namespace foscam_api
+{
+  struct Header;
+}
+
+class Foscam : public IPCam, public std::enable_shared_from_this<Foscam>
 {
 public:
-    Foscam(const std::string & in_strIPAddress, unsigned int in_unPort, unsigned int in_unUID,
-    		const std::string & in_strUser, const std::string & in_strPassword, const int in_Framerate);
-    ~Foscam();
+  Foscam(boost::asio::io_service & io_service, const std::string & host, unsigned int port, unsigned int uid,
+      const std::string & user, const std::string & password, const int framerate);
+  ~Foscam();
 
-    virtual bool VideoOn() override;
-    virtual bool AudioOn() override;
-    unsigned int GetVideoDataAvailable();
-    unsigned int GetVideoData(uint8_t * in_pData, unsigned int in_unDataLength);
+  virtual void Connect() override;
+  virtual void Disconnect() override;
+  virtual bool VideoOn() override;
+  virtual bool AudioOn() override;
+  virtual unsigned int GetAvailableVideoStreamData() override;
+  virtual unsigned int GetVideoStreamData(uint8_t * in_pData, unsigned int in_unDataLength) override;
 
 private:
-    void DataThread();
+  void do_read_header();
+  void do_handle_event(foscam_api::Header header);
 
-    int mSock;
-    unsigned int munUID;
-    const std::string mstrUser;
-    const std::string mstrPassword;
-    const int mnFramerate;
-    std::mutex mDataThreadMutex;
-    std::condition_variable mVideoOnReplyCond;
-    std::condition_variable mAudioOnReplyCond;
-    std::atomic<bool> mfStartDataThread;
-    std::atomic<bool> mfStopDataThread;
-    std::thread mDataThread;
-    std::queue<uint8_t> mVideoBuffer;
-    std::queue<uint8_t> mAudioBuffer;
+private:
+	boost::asio::io_service& io_service_;
+	boost::asio::ip::tcp::socket socket_;
+  unsigned int uid_;
+  const std::string user_;
+  const std::string password_;
+  const int framerate_;
+  std::mutex reply_cond_mutex_;
+  std::condition_variable video_on_reply_cond_;
+  std::condition_variable audio_on_reply_cond_;
+  boost::lockfree::spsc_queue<uint8_t> video_buffer_;
+  boost::lockfree::spsc_queue<uint8_t> audio_buffer_;
+  boost::lockfree::spsc_queue<uint8_t> video_stream_buffer_;
 
-    FFMpegRemuxer mRemuxer;
+  FFMpegRemuxer remuxer_;
 };
 
 #endif // FOSCAM_H

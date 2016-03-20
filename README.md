@@ -1,2 +1,2 @@
 # foscam_hd
-QT GUI for Foscam hd ip cams.
+Web application for Foscam hd ip cams.
