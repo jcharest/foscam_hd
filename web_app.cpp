@@ -1,25 +1,26 @@
-#include <cstring>
+#include <web_app.h>
+
+#include <fstream>
 #include <iostream>
-#include <thread>
-#include <chrono>
-#include <sys/types.h>
-#include <sys/select.h>
-#include <sys/socket.h>
+
 #include <microhttpd.h>
 
-#include <web_app.h>
+namespace
+{
 
 const unsigned int PORT = 8888;
 
-using namespace std;
+} // namespace
 
-WebAppException::WebAppException(const std::string & in_strWhat) : mstrWhat(in_strWhat)
+namespace foscam_hd {
+
+WebAppException::WebAppException(const std::string & what) : what_("WebAppException: " + what)
 {
 }
 
 const char* WebAppException::what() const noexcept
 {
-	return ("WebAppException: " + mstrWhat).c_str();
+	return what_.c_str();
 }
 
 int HandleConnectionCallback(void * in_pvClass, MHD_Connection * in_pConnection, const char * in_pszUrl,
@@ -38,18 +39,18 @@ ssize_t HandleVideoStreamCallback(void * in_pvClass, uint64_t in_Pos, char * out
 	return pApp->HandleVideoStream(reinterpret_cast<uint8_t *>(out_pn8Buffer), in_MaxSize);
 }
 
-WebApp::WebApp(shared_ptr<IPCam> cam)
- : cam_(cam), mpHttpServer(nullptr)
+WebApp::WebApp(std::shared_ptr<foscam_hd::IPCamInterface> cam)
+ : cam_(cam), http_server_(nullptr)
 {
-	BufferFile("favicon.ico", mFavicon);
-	BufferFile("video_player.html", mFavicon);
+	BufferFile("favicon.ico", favicon_);
+	BufferFile("video_player.html", favicon_);
 
 	cam_->VideoOn();
 	cam_->AudioOn();
 
-	mpHttpServer = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, PORT, nullptr, nullptr,
+	http_server_ = MHD_start_daemon(MHD_USE_THREAD_PER_CONNECTION, PORT, nullptr, nullptr,
 			HandleConnectionCallback, this, MHD_OPTION_END);
-	if(mpHttpServer == nullptr)
+	if(http_server_ == nullptr)
 	{
 		throw WebAppException("Failed to start HTTP server");
 	}
@@ -57,14 +58,14 @@ WebApp::WebApp(shared_ptr<IPCam> cam)
 
 WebApp::~WebApp()
 {
-	if(mpHttpServer)
+	if(http_server_)
 	{
-		MHD_stop_daemon(mpHttpServer);
+		MHD_stop_daemon(http_server_);
 	}
 }
-void WebApp::BufferFile(const string & in_strFilePath, vector<uint8_t> & out_Buffer)
+void WebApp::BufferFile(const std::string & in_strFilePath, std::vector<uint8_t> & out_Buffer)
 {
-	ifstream File(in_strFilePath.c_str(), ifstream::binary);
+	std::ifstream File(in_strFilePath.c_str(), std::ifstream::binary);
 	File.seekg (0, File.end);
 	int nFileLength = File.tellg();
 	File.seekg (0, File.beg);
@@ -79,23 +80,23 @@ void WebApp::BufferFile(const string & in_strFilePath, vector<uint8_t> & out_Buf
 int WebApp::HandleConnection(MHD_Connection * in_pConnection, const char * in_pszUrl,
     		const char * in_pszMethod, const char *in_pszVersion)
 {
-	cout << in_pszUrl << endl;
+  std::cout << in_pszUrl << std::endl;
 
 	// Check method type
-	if(string(in_pszMethod) != MHD_HTTP_METHOD_GET)
+	if(std::string(in_pszMethod) != MHD_HTTP_METHOD_GET)
 	{
 		return MHD_NO;
 	}
 
-	if(in_pszUrl == string("/"))
+	if(in_pszUrl == std::string("/"))
 	{
-		return HandleGetBuffer(in_pConnection, mFavicon, "text/html");
+		return HandleGetBuffer(in_pConnection, favicon_, "text/html");
 	}
-	else if(in_pszUrl == string("/favicon.ico"))
+	else if(in_pszUrl == std::string("/favicon.ico"))
 	{
-		return HandleGetBuffer(in_pConnection, mFavicon, "image/x-icon");
+		return HandleGetBuffer(in_pConnection, favicon_, "image/x-icon");
 	}
-	else if(in_pszUrl == string("/video_stream"))
+	else if(in_pszUrl == std::string("/video_stream"))
 	{
 		return HandleGetVideoStream(in_pConnection);
 	}
@@ -131,3 +132,5 @@ ssize_t WebApp::HandleVideoStream(uint8_t * out_pun8Buffer, size_t in_MaxSize)
 {
 	return cam_->GetVideoStreamData(out_pun8Buffer, in_MaxSize);
 }
+
+} // namespace foscam_hd

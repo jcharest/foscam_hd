@@ -1,37 +1,41 @@
-#ifndef FOSCAM_H
-#define FOSCAM_H
+#ifndef FOSCAM_H_
+#define FOSCAM_H_
 
-#include <string>
-#include <mutex>
+#include "ip_cam_interface.h"
+
 #include <condition_variable>
-#include <ffmpeg_remuxer.h>
-#include <ip_cam.h>
+#include <memory>
+#include <mutex>
+#include <string>
 
 #include <boost/asio.hpp>
 #include <boost/lockfree/spsc_queue.hpp>
 
-class FoscamException : public std::exception
-{
-public:
-	FoscamException(const std::string & in_strWhat);
-
-	virtual const char* what() const noexcept override;
-
-private:
-	std::string mstrWhat;
-};
+#include "ffmpeg_remuxer.h"
 
 namespace foscam_api
 {
   struct Header;
 }
 
-class Foscam : public IPCam, public std::enable_shared_from_this<Foscam>
-{
+namespace foscam_hd {
+
+class FoscamException : public std::exception {
 public:
-  Foscam(boost::asio::io_service & io_service, const std::string & host, unsigned int port, unsigned int uid,
-      const std::string & user, const std::string & password, const int framerate);
-  ~Foscam();
+  explicit FoscamException(const std::string & what);
+
+	virtual const char* what() const noexcept override;
+
+private:
+	std::string what_;
+};
+
+class Foscam : public IPCamInterface, public std::enable_shared_from_this<Foscam> {
+public:
+  Foscam(const std::string & host, unsigned int port, unsigned int uid,
+         const std::string & user, const std::string & password, const int framerate,
+         boost::asio::io_service & io_service);
+  virtual ~Foscam();
 
   virtual void Connect() override;
   virtual void Disconnect() override;
@@ -59,6 +63,13 @@ private:
   boost::lockfree::spsc_queue<uint8_t> video_stream_buffer_;
 
   FFMpegRemuxer remuxer_;
+
+  Foscam(const Foscam & foscam) = delete;
+  Foscam(Foscam && foscam) = delete;
+  Foscam & operator=(const Foscam & foscam) = delete;
+  Foscam & operator=(Foscam && foscam) = delete;
 };
 
-#endif // FOSCAM_H
+} // namespace foscam_hd
+
+#endif // FOSCAM_H_

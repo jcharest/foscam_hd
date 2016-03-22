@@ -1,9 +1,5 @@
-#ifndef FFMPEG_REMUXER_H
-#define FFMPEG_REMUXER_H
-
-#include <memory>
-#include <atomic>
-#include <thread>
+#ifndef FFMPEG_REMUXER_H_
+#define FFMPEG_REMUXER_H_
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -11,13 +7,19 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
+#include <atomic>
+#include <memory>
+#include <thread>
+
 struct AVFilterContext;
 struct AVFilterGraph;
 
-class FFMpegRemuxerException : std::exception
+namespace foscam_hd {
+
+class FFMpegRemuxerException : public std::exception
 {
 public:
-	FFMpegRemuxerException(const std::string & in_strWhat);
+  explicit FFMpegRemuxerException(const std::string & in_strWhat);
 
 	virtual const char* what() const noexcept;
 
@@ -48,8 +50,8 @@ class FFMpegRemuxer
 {
 public:
 	FFMpegRemuxer(std::unique_ptr<InDataFunctor> && in_VideoFunc, std::unique_ptr<InDataFunctor> && in_AudioFunc,
-			std::unique_ptr<OutStreamFunctor> && in_OutStreamFunc, double in_dFramerate);
-    ~FFMpegRemuxer();
+	              double in_dFramerate, std::unique_ptr<OutStreamFunctor> && in_OutStreamFunc);
+  ~FFMpegRemuxer();
 
 private:
     class Registrator
@@ -129,6 +131,13 @@ private:
     InputStreamContext mVideoInputStream;
     AudioInputStreamContext mAudioInputStream;
     OutputStreamContext mOutputStream;
+
+    FFMpegRemuxer(const FFMpegRemuxer & ffmpeg_remuxer) = delete;
+    FFMpegRemuxer(FFMpegRemuxer && ffmpeg_remuxer) = delete;
+    FFMpegRemuxer & operator=(const FFMpegRemuxer & ffmpeg_remuxer) = delete;
+    FFMpegRemuxer & operator=(FFMpegRemuxer && ffmpeg_remuxer) = delete;
 };
 
-#endif // FFMPEG_REMUXER_H
+} // namespace foscam_hd
+
+#endif // FFMPEG_REMUXER_H_

@@ -1,32 +1,32 @@
-#include <iostream>
-#include <cstdlib>
-#include <boost/shared_array.hpp>
+#include "ffmpeg_remuxer.h"
 
 extern "C" {
 #include <libavutil/opt.h>
 }
 
-#include "ffmpeg_remuxer.h"
+#include <boost/shared_array.hpp>
 
-using namespace std;
+namespace {
 
-static const size_t VIDEO_BUFFER_SIZE = 4 * 1024;
-static const size_t VIDEO_PROBE_SIZE = 256 * 1024;
+const size_t VIDEO_BUFFER_SIZE = 4 * 1024;
+const size_t VIDEO_PROBE_SIZE = 256 * 1024;
+const size_t AUDIO_BUFFER_SIZE = 4 * 1024;
 
-static const size_t AUDIO_BUFFER_SIZE = 4 * 1024;
+} // namespace
 
+namespace foscam_hd {
 
-FFMpegRemuxerException::FFMpegRemuxerException(const std::string & in_strWhat) : mstrWhat(in_strWhat)
+FFMpegRemuxerException::FFMpegRemuxerException(const std::string & in_strWhat) : mstrWhat("FFMpegRemuxerException: " + in_strWhat)
 {
 }
 
 const char* FFMpegRemuxerException::what() const noexcept
 {
-	return ("FFMpegRemuxerException" + mstrWhat).c_str();
+	return mstrWhat.c_str();
 }
 
-FFMpegRemuxer::FFMpegRemuxer(unique_ptr<InDataFunctor> && in_VideoFunc, unique_ptr<InDataFunctor> && in_AudioFunc,
-		unique_ptr<OutStreamFunctor> && in_OutStreamFunc, double in_dFramerate)
+FFMpegRemuxer::FFMpegRemuxer(std::unique_ptr<InDataFunctor> && in_VideoFunc, std::unique_ptr<InDataFunctor> && in_AudioFunc,
+                             double in_dFramerate, std::unique_ptr<OutStreamFunctor> && in_OutStreamFunc)
  : mdFramerate(in_dFramerate), mfStartThread(false),
    mfStopThread(false), mThread(&FFMpegRemuxer::ThreadRun, this),
    mVideoInputStream(VIDEO_BUFFER_SIZE, move(in_VideoFunc)),
@@ -75,7 +75,7 @@ FFMpegRemuxer::InputStreamContext::InputStreamContext(size_t in_BufferSize, std:
 		}
 		pAVFormat->pb = pAVAvio;
 	}
-	catch(exception & Ex)
+	catch(std::exception & Ex)
 	{
 		Release();
 		throw Ex;
@@ -123,7 +123,7 @@ static int WriteData(void * in_pvOpaque, uint8_t * in_aun8Buffer, int in_nBuffer
 	return (*pFunc)(in_aun8Buffer, in_nBufferSize);
 }
 
-FFMpegRemuxer::OutputStreamContext::OutputStreamContext(size_t in_BufferSize, unique_ptr<OutStreamFunctor> && in_StreamFunc)
+FFMpegRemuxer::OutputStreamContext::OutputStreamContext(size_t in_BufferSize, std::unique_ptr<OutStreamFunctor> && in_StreamFunc)
  : pAVFormat(nullptr), pAVAvio(nullptr), pVideoStream(nullptr), pAudioStream(nullptr), mStreamFunc(move(in_StreamFunc))
 {
 	avformat_alloc_output_context2(&pAVFormat, NULL, NULL, "test.mp4");
@@ -165,7 +165,7 @@ void FFMpegRemuxer::ThreadRun()
 {
 	while(!mfStartThread)
 	{
-		this_thread::sleep_for(chrono::milliseconds(100));
+	  std::this_thread::sleep_for(std::chrono::milliseconds(100));
 	}
 
 	bool fOutputHeaderWritten = false;
@@ -173,7 +173,7 @@ void FFMpegRemuxer::ThreadRun()
 	{
 		if(mVideoInputStream.GetAvailableData() == 0 && mAudioInputStream.GetAvailableData() == 0)
 		{
-			this_thread::sleep_for(chrono::milliseconds(10));
+		  std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
 
 		if(fOutputHeaderWritten)
@@ -213,7 +213,7 @@ void FFMpegRemuxer::CreateVideoStream(InputStreamContext & io_pInputStream)
 	AVInputFormat * pformat = av_find_input_format("h264");
 	AVDictionary * Options = nullptr;
 	av_dict_set_int(&Options, "probesize2", VIDEO_PROBE_SIZE, 0);
-	av_dict_set(&Options, "framerate", to_string(mdFramerate).c_str(), 0);
+	av_dict_set(&Options, "framerate", std::to_string(mdFramerate).c_str(), 0);
 
 	auto Ret = avformat_open_input(&io_pInputStream.pAVFormat, nullptr, pformat, &Options);
 	if(Ret < 0)
@@ -372,7 +372,7 @@ struct AVInputSamplesDeleter {
 		}
 	}
 };
-typedef unique_ptr<uint8_t *, AVInputSamplesDeleter> AVInputSamplesPtr;
+typedef std::unique_ptr<uint8_t *, AVInputSamplesDeleter> AVInputSamplesPtr;
 
 void FFMpegRemuxer::TranscodeAudioPacket(AudioInputStreamContext & io_pInputStream)
 {
@@ -396,7 +396,7 @@ void FFMpegRemuxer::TranscodeAudioPacket(AudioInputStreamContext & io_pInputStre
 	{
 		char szError[AV_ERROR_MAX_STRING_SIZE];
 		av_strerror(Ret, szError, AV_ERROR_MAX_STRING_SIZE);
-		throw FFMpegRemuxerException(string("Failed to decode frame: ") + szError);
+		throw FFMpegRemuxerException(std::string("Failed to decode frame: ") + szError);
 	}
 	if(!nGotFrame)
 	{
@@ -494,3 +494,5 @@ void FFMpegRemuxer::TranscodeAudioPacket(AudioInputStreamContext & io_pInputStre
 		throw FFMpegRemuxerException("Failed to remux packet");
 	}
 }
+
+} // namespace foscam_hd

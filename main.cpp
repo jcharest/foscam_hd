@@ -1,47 +1,46 @@
 #include <iostream>
 #include <thread>
+
 #include <foscam.h>
 #include <web_app.h>
 
 
-using namespace std;
-
 int main(int argc, char *argv[])
 {
   boost::asio::io_service io_service;
-  shared_ptr<Foscam> cam;
+  std::shared_ptr<foscam_hd::Foscam> cam;
   try
   {
-    cam = make_shared<Foscam>(io_service, "192.168.1.8", 88, time(NULL), "admin","***REMOVED***", 30);
+    cam = std::make_shared<foscam_hd::Foscam>("192.168.1.8", 88, time(NULL), "admin","***REMOVED***", 30, io_service);
     cam->Connect();
   }
-	catch (exception & ex)
+	catch (std::exception & ex)
   {
-	  cerr << "Failed to connect to camera: " << ex.what() << endl;
+	  std::cerr << "Failed to connect to camera: " << ex.what() << std::endl;
   }
 
 	// Start asio thread
-  thread io_thread([&io_service](){
+	std::thread io_thread([&io_service](){
     try
     {
       io_service.run();
     }
-    catch (exception & ex)
+    catch (std::exception & ex)
     {
-      cerr << "Failure occured while running service thread: " << ex.what() << endl;
+      std::cerr << "Failure occured while running service thread: " << ex.what() << std::endl;
     }
   });
 
   try
   {
-    WebApp App(cam);
+    foscam_hd::WebApp App(cam);
     getchar();
     cam->Disconnect();
     io_thread.join();
   }
-  catch (exception & ex)
+  catch (std::exception & ex)
   {
-    cerr << "Failure occured while running web application: " << ex.what() << endl;
+    std::cerr << "Failure occured while running web application: " << ex.what() << std::endl;
   }
 
 	return EXIT_SUCCESS;

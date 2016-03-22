@@ -1,30 +1,31 @@
-#ifndef WEB_APP_H
-#define WEB_APP_H
+#ifndef WEB_APP_H_
+#define WEB_APP_H_
 
+#include <memory>
 #include <string>
-#include <fstream>
 #include <vector>
-#include <ip_cam.h>
 
-class WebAppException : std::exception
-{
-public:
-	WebAppException(const std::string & in_strWhat);
-
-	virtual const char* what() const noexcept;
-
-private:
-	std::string mstrWhat;
-};
-
+#include "ip_cam_interface.h"
 
 struct MHD_Daemon;
 struct MHD_Connection;
-class WebApp
-{
+
+namespace foscam_hd {
+
+class WebAppException : public std::exception {
 public:
-	WebApp(std::shared_ptr<IPCam> cam);
-    ~WebApp();
+  explicit WebAppException(const std::string & what);
+
+	virtual const char* what() const noexcept override;
+
+private:
+	std::string what_;
+};
+
+class WebApp {
+public:
+	explicit WebApp(std::shared_ptr<foscam_hd::IPCamInterface> cam);
+  ~WebApp();
 
 private:
     void BufferFile(const std::string & in_strFilePath, std::vector<uint8_t> & out_Buffer);
@@ -40,10 +41,17 @@ private:
     		size_t *in_UploadDataSize, void ** out_ppcConnClass);
     friend ssize_t HandleVideoStreamCallback(void * in_pvClass, uint64_t in_Pos, char * out_pn8Buffer, size_t in_MaxSize);
 
-    std::shared_ptr<IPCam> cam_;
-    struct MHD_Daemon * mpHttpServer;
-    std::vector<uint8_t> mFavicon;
-    std::vector<uint8_t> mVideoPlayer;
+    std::shared_ptr<foscam_hd::IPCamInterface> cam_;
+    struct MHD_Daemon * http_server_;
+    std::vector<uint8_t> favicon_;
+    std::vector<uint8_t> video_player_;
+
+    WebApp(const WebApp & web_app) = delete;
+    WebApp(WebApp && web_app) = delete;
+    WebApp & operator=(const WebApp & web_app) = delete;
+    WebApp & operator=(WebApp && web_app) = delete;
 };
 
-#endif // WEB_APP_H
+} // namespace foscam_hd
+
+#endif // WEB_APP_H_

@@ -5,7 +5,6 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -ggdb -Wall -std=c++14")
 
 # Global requirements
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake_modules)
-
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
 find_package(Boost REQUIRED system)
