@@ -9,6 +9,7 @@ extern "C" {
 
 #include <atomic>
 #include <memory>
+#include <string>
 #include <thread>
 
 struct AVFilterContext;
@@ -16,128 +17,127 @@ struct AVFilterGraph;
 
 namespace foscam_hd {
 
-class FFMpegRemuxerException : public std::exception
-{
-public:
-  explicit FFMpegRemuxerException(const std::string & in_strWhat);
+class FFMpegRemuxerException : public std::exception {
+ public:
+  explicit FFMpegRemuxerException(const std::string & what);
 
-	virtual const char* what() const noexcept;
+  const char* what() const noexcept override;
 
-private:
-	std::string mstrWhat;
+ private:
+  std::string what_;
 };
 
-class InDataFunctor
-{
-public:
-	InDataFunctor() = default;
-	virtual ~InDataFunctor() = default;
+class InDataFunctor {
+ public:
+  InDataFunctor() = default;
+  virtual ~InDataFunctor() = default;
 
-	virtual int operator()(uint8_t * out_aun8Buffer, int in_nBufferSize) = 0;
-	virtual size_t GetAvailableData() = 0;
+  virtual int operator()(uint8_t * buffer, int buffer_size) = 0;
+  virtual size_t GetAvailableData() = 0;
 };
 
-class OutStreamFunctor
-{
-public:
-	OutStreamFunctor() = default;
-	virtual ~OutStreamFunctor() = default;
+class OutStreamFunctor {
+ public:
+  OutStreamFunctor() = default;
+  virtual ~OutStreamFunctor() = default;
 
-	virtual int operator()(const uint8_t * in_aun8Buffer, int in_nBufferSize) = 0;
+  virtual int operator()(const uint8_t * buffer, int buffer_size) = 0;
 };
 
-class FFMpegRemuxer
-{
-public:
-	FFMpegRemuxer(std::unique_ptr<InDataFunctor> && in_VideoFunc, std::unique_ptr<InDataFunctor> && in_AudioFunc,
-	              double in_dFramerate, std::unique_ptr<OutStreamFunctor> && in_OutStreamFunc);
+class FFMpegRemuxer {
+ public:
+  FFMpegRemuxer(std::unique_ptr<InDataFunctor> && video_func,
+                std::unique_ptr<InDataFunctor> && audio_func,
+                double framerate,
+                std::unique_ptr<OutStreamFunctor> && output_stream_func);
   ~FFMpegRemuxer();
 
-private:
-    class Registrator
-	{
-	public:
-    	Registrator();
-	};
+ private:
+  class Registrator {
+   public:
+    Registrator();
+  };
 
-    class InputStreamContext
-	{
-	public:
-    	InputStreamContext(size_t in_BufferSize, std::unique_ptr<InDataFunctor> && in_DataFunc);
-    	~InputStreamContext();
+  class InputStreamContext {
+   public:
+    InputStreamContext(size_t buffer_size,
+                       std::unique_ptr<InDataFunctor> && data_func);
+    ~InputStreamContext();
 
-    	size_t GetAvailableData();
+    size_t GetAvailableData();
 
-		AVFormatContext * pAVFormat;
-		AVIOContext * pAVAvio;
-	private:
-		void Release();
+    AVFormatContext * av_format_;
+    AVIOContext * av_avio_;
+   private:
+    void Release();
 
-		std::unique_ptr<InDataFunctor> mDataFunc;
-	};
-    class AudioInputStreamContext : public InputStreamContext
-	{
-    public:
-    	AudioInputStreamContext(size_t in_BufferSize, std::unique_ptr<InDataFunctor> && in_DataFunc);
-    	~AudioInputStreamContext();
+    std::unique_ptr<InDataFunctor> data_func_;
+  };
 
-    	SwrContext * pAudioResampler;
-    	AVAudioFifo * pAudioFifo;
+  class AudioInputStreamContext : public InputStreamContext {
+   public:
+    AudioInputStreamContext(size_t buffer_size,
+                            std::unique_ptr<InDataFunctor> && data_func);
+    ~AudioInputStreamContext();
 
-    private:
-		void Release();
-	};
-    class OutputStreamContext
-    {
-    public:
-    	OutputStreamContext(size_t in_BufferSize, std::unique_ptr<OutStreamFunctor> && in_StreamFunc);
-    	~OutputStreamContext();
+    SwrContext * audio_resampler_;
+    AVAudioFifo * audio_fifo_;
 
-    	AVFormatContext * pAVFormat;
-    	AVIOContext * pAVAvio;
-    	AVStream * pVideoStream;
-    	AVStream * pAudioStream;
+   private:
+    void Release();
+  };
 
-    private:
-    	void Release();
+  class OutputStreamContext {
+   public:
+    OutputStreamContext(size_t buffer_size,
+                        std::unique_ptr<OutStreamFunctor> && stream_func);
+    ~OutputStreamContext();
 
-    	std::unique_ptr<OutStreamFunctor> mStreamFunc;
-    };
+    AVFormatContext * av_format_;
+    AVIOContext * av_avio_;
+    AVStream * video_stream_;
+    AVStream * audio_stream_;
 
-    struct AVFrameDeleter {
-		void operator()(AVFrame * p)
-		{
-			av_frame_free(&p);
-		}
-	};
-	typedef std::unique_ptr<AVFrame, AVFrameDeleter> AVFramePtr;
+   private:
+    void Release();
 
-    void ThreadRun();
+    std::unique_ptr<OutStreamFunctor> stream_func_;
+  };
 
-    void CreateVideoStream(InputStreamContext & io_pInputStream);
-    void CreateAudioStream(AudioInputStreamContext & io_pInputStream);
+  struct AVFrameDeleter {
+    void operator()(AVFrame * p) {
+      av_frame_free(&p);
+    }
+  };
+  typedef std::unique_ptr<AVFrame, AVFrameDeleter> AVFramePtr;
 
-    void RemuxVideoPacket(InputStreamContext & io_pInputStream);
-    void TranscodeAudioPacket(AudioInputStreamContext & io_pInputStream);
-    void TranscodeAudioPacket(AudioInputStreamContext & io_pInputStream, AVFramePtr & in_ptrFrame);
+  void ThreadRun();
 
-    double mdFramerate;
+  void CreateVideoStream(InputStreamContext & input_stream);
+  void CreateAudioStream(AudioInputStreamContext & input_stream);
 
-    std::atomic<bool> mfStartThread;
-    std::atomic<bool> mfStopThread;
-    std::thread mThread;
+  void RemuxVideoPacket(InputStreamContext & input_stream);
+  void TranscodeAudioPacket(AudioInputStreamContext & input_stream);
+  void TranscodeAudioPacket(AudioInputStreamContext & input_stream,
+                            AVFramePtr & frame);
 
-    Registrator mRegistrator;
-    InputStreamContext mVideoInputStream;
-    AudioInputStreamContext mAudioInputStream;
-    OutputStreamContext mOutputStream;
+  double framerate_;
 
-    FFMpegRemuxer(const FFMpegRemuxer & ffmpeg_remuxer) = delete;
-    FFMpegRemuxer(FFMpegRemuxer && ffmpeg_remuxer) = delete;
-    FFMpegRemuxer & operator=(const FFMpegRemuxer & ffmpeg_remuxer) = delete;
-    FFMpegRemuxer & operator=(FFMpegRemuxer && ffmpeg_remuxer) = delete;
+  std::atomic_bool start_thread_;
+  std::atomic_bool stop_thread_;
+  std::thread thread_;
+
+  Registrator registrator_;
+  InputStreamContext video_input_stream_;
+  AudioInputStreamContext audio_input_stream_;
+  OutputStreamContext output_stream_;
+
+  FFMpegRemuxer(const FFMpegRemuxer &) = delete;
+  FFMpegRemuxer(FFMpegRemuxer &&) = delete;
+  FFMpegRemuxer & operator=(const FFMpegRemuxer &) = delete;
+  FFMpegRemuxer & operator=(FFMpegRemuxer &&) = delete;
 };
 
-} // namespace foscam_hd
+}  // namespace foscam_hd
 
-#endif // FFMPEG_REMUXER_H_
+#endif  // FFMPEG_REMUXER_H_
