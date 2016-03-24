@@ -20,8 +20,7 @@ FFMpegRemuxerException::FFMpegRemuxerException(const std::string & what)
     : what_("FFMpegRemuxerException: " + what) {
 }
 
-const char* FFMpegRemuxerException::what() const noexcept
-{
+const char* FFMpegRemuxerException::what() const noexcept {
   return what_.c_str();
 }
 
@@ -92,7 +91,7 @@ size_t FFMpegRemuxer::InputStreamContext::GetAvailableData() {
 }
 
 void FFMpegRemuxer::InputStreamContext::Release() {
-  avformat_free_context (av_format_);
+  avformat_free_context(av_format_);
   if (av_avio_) {
     av_freep(&av_avio_->buffer);
     av_freep(&av_avio_);
@@ -152,7 +151,7 @@ FFMpegRemuxer::OutputStreamContext::~OutputStreamContext() {
 }
 
 void FFMpegRemuxer::OutputStreamContext::Release() {
-  avformat_free_context (av_format_);
+  avformat_free_context(av_format_);
 
   if (av_avio_) {
     av_freep(&av_avio_->buffer);
@@ -177,8 +176,8 @@ void FFMpegRemuxer::ThreadRun() {
       TranscodeAudioPacket(audio_input_stream_);
     } else {
       if (video_input_stream_.GetAvailableData() > VIDEO_PROBE_SIZE) {
-        CreateVideoStream (video_input_stream_);
-        CreateAudioStream (audio_input_stream_);
+        CreateVideoStream(video_input_stream_);
+        CreateAudioStream(audio_input_stream_);
 
         // Set fragmented mp4 options
         AVDictionary * flags = nullptr;
@@ -356,7 +355,7 @@ typedef std::unique_ptr<uint8_t *, AVInputSamplesDeleter> AVInputSamplesPtr;
 
 }  // namespace
 
-void FFMpegRemuxer::TranscodeAudioPacket( 
+void FFMpegRemuxer::TranscodeAudioPacket(
     AudioInputStreamContext & input_stream) {
 
   // Read packet
