@@ -80,20 +80,20 @@ BOOST_FUSION_DEFINE_STRUCT(
 
 BOOST_FUSION_DEFINE_STRUCT(
   (foscam_api),
+  CloseConnection,
+  (foscam_api::Reserved<1>, reserved)
+  (foscam_api::FixedString<64>, username)
+  (foscam_api::FixedString<64>, password)
+)
+
+BOOST_FUSION_DEFINE_STRUCT(
+  (foscam_api),
   VideoOnRequest,
   (foscam_api::Videostream, stream)
   (foscam_api::FixedString<64>, username)
   (foscam_api::FixedString<64>, password)
   (uint32_t, uid)
   (foscam_api::Reserved<28>, reserved)
-)
-
-BOOST_FUSION_DEFINE_STRUCT(
-  (foscam_api),
-  CloseConnection,
-  (foscam_api::Reserved<1>, reserved)
-  (foscam_api::FixedString<64>, username)
-  (foscam_api::FixedString<64>, password)
 )
 
 BOOST_FUSION_DEFINE_STRUCT(
@@ -344,6 +344,23 @@ class VideoStreamFunc : public foscam_hd::OutStreamFunctor {
   boost::lockfree::spsc_queue<uint8_t> & data_buffer_;
 };
 
+template<typename T>
+std::vector<uint8_t> PrepareCommand(foscam_api::Command type,
+    std::function<void(T &)> yield_command_func) {
+  foscam_api::Header header;
+  header.type = type;
+  header.size = get_size<T>();
+  T request;
+  yield_command_func(request);
+
+  auto header_size = get_size<foscam_api::Header>();
+  std::vector<uint8_t> message_buf(header_size + header.size);
+  write(asio::buffer(message_buf), header);
+  write(asio::buffer(message_buf) + header_size, request);
+
+  return message_buf;
+}
+
 }  // namespace
 
 namespace foscam_hd {
@@ -389,17 +406,14 @@ void Foscam::Connect() {
 }
 
 void Foscam::Disconnect() {
-  foscam_api::Header header;
-  header.type = foscam_api::Command::CLOSE_CONNECTION;
-  header.size = get_size<foscam_api::CloseConnection>();
-  foscam_api::CloseConnection request;
-  strncpy(request.username.str, user_.c_str(), request.username.size);
-  strncpy(request.password.str, password_.c_str(), request.password.size);
-
-  auto header_size = get_size<foscam_api::Header>();
-  std::vector<uint8_t> message_buf(header_size + header.size);
-  write(asio::buffer(message_buf), header);
-  write(asio::buffer(message_buf) + header_size, request);
+  auto message_buf = PrepareCommand<foscam_api::CloseConnection>(
+      foscam_api::Command::CLOSE_CONNECTION,
+      [this](foscam_api::CloseConnection & request){
+        strncpy(request.username.str, user_.c_str(),
+                request.username.size);
+        strncpy(request.password.str, password_.c_str(),
+                request.password.size);
+      });
 
   asio::write(socket_, asio::buffer(message_buf));
 }
@@ -407,19 +421,15 @@ void Foscam::Disconnect() {
 bool Foscam::VideoOn() {
   std::unique_lock<std::mutex> lock(reply_cond_mutex_);
 
-  foscam_api::Header header;
-  header.type = foscam_api::Command::VIDEO_ON_REQUEST;
-  header.size = get_size<foscam_api::VideoOnRequest>();
-  foscam_api::VideoOnRequest request;
-  request.stream = foscam_api::Videostream::MAIN;
-  strncpy(request.username.str, user_.c_str(), request.username.size);
-  strncpy(request.password.str, password_.c_str(), request.password.size);
-  request.uid = uid_;
-
-  auto header_size = get_size<foscam_api::Header>();
-  std::vector<uint8_t> message_buf(header_size + header.size);
-  write(asio::buffer(message_buf), header);
-  write(asio::buffer(message_buf) + header_size, request);
+  auto message_buf = PrepareCommand<foscam_api::VideoOnRequest>(
+      foscam_api::Command::VIDEO_ON_REQUEST,
+      [this](foscam_api::VideoOnRequest & request){
+        strncpy(request.username.str, user_.c_str(),
+                request.username.size);
+        strncpy(request.password.str, password_.c_str(),
+                request.password.size);
+        request.uid = uid_;
+      });
 
   asio::write(socket_, asio::buffer(message_buf));
 
@@ -431,17 +441,14 @@ bool Foscam::VideoOn() {
 bool Foscam::AudioOn() {
   std::unique_lock<std::mutex> lock(reply_cond_mutex_);
 
-  foscam_api::Header header;
-  header.type = foscam_api::Command::AUDIO_ON_REQUEST;
-  header.size = get_size<foscam_api::AudioOnRequest>();
-  foscam_api::AudioOnRequest request;
-  strncpy(request.username.str, user_.c_str(), request.username.size);
-  strncpy(request.password.str, password_.c_str(), request.password.size);
-
-  auto header_size = get_size<foscam_api::Header>();
-  std::vector<uint8_t> message_buf(header_size + header.size);
-  write(asio::buffer(message_buf), header);
-  write(asio::buffer(message_buf) + header_size, request);
+  auto message_buf = PrepareCommand<foscam_api::AudioOnRequest>(
+      foscam_api::Command::AUDIO_ON_REQUEST,
+      [this](foscam_api::AudioOnRequest & request){
+        strncpy(request.username.str, user_.c_str(),
+                request.username.size);
+        strncpy(request.password.str, password_.c_str(),
+                request.password.size);
+      });
 
   asio::write(socket_, asio::buffer(message_buf));
 
@@ -542,7 +549,6 @@ void Foscam::HandleEvent(foscam_api::Header header) {
           });
       break;
     }
-
 
     case foscam_api::Command::VIDEO_DATA: {
       auto video_data_buf =

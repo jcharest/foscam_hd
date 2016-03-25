@@ -28,9 +28,6 @@ class WebApp {
   ~WebApp();
 
  private:
-  void BufferFile(const std::string & file_path,
-                  std::vector<uint8_t> & buffer);
-
   int HandleConnection(struct MHD_Connection * connection,
                        const char * url, const char * method,
                        const char * version);

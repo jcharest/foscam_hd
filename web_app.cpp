@@ -9,6 +9,18 @@ namespace {
 
 const unsigned int PORT = 8888;
 
+void BufferFile(const std::string & file_path, std::vector<uint8_t> & buffer) {
+  std::ifstream file(file_path.c_str(), std::ifstream::binary);
+  file.seekg(0, file.end);
+  int file_size = file.tellg();
+  file.seekg(0, file.beg);
+  buffer.resize(file_size);
+  file.read(reinterpret_cast<char *>(buffer.data()), file_size);
+  if (!file) {
+    throw foscam_hd::WebAppException("Failed to read " + file_path);
+  }
+}
+
 }  // namespace
 
 namespace foscam_hd {
@@ -42,7 +54,7 @@ ssize_t HandleVideoStreamCallback(void * callback_object, uint64_t position,
 WebApp::WebApp(std::shared_ptr<foscam_hd::IPCamInterface> cam)
     : cam_(cam), http_server_(nullptr) {
   BufferFile("favicon.ico", favicon_);
-  BufferFile("video_player.html", favicon_);
+  BufferFile("video_player.html", video_player_);
 
   cam_->VideoOn();
   cam_->AudioOn();
@@ -60,18 +72,6 @@ WebApp::~WebApp() {
     MHD_stop_daemon(http_server_);
   }
 }
-void WebApp::BufferFile(const std::string & file_path,
-                        std::vector<uint8_t> & buffer) {
-  std::ifstream file(file_path.c_str(), std::ifstream::binary);
-  file.seekg(0, file.end);
-  int file_size = file.tellg();
-  file.seekg(0, file.beg);
-  buffer.resize(file_size);
-  file.read(reinterpret_cast<char *>(buffer.data()), file_size);
-  if (!file) {
-    throw WebAppException("Failed to read " + file_path);
-  }
-}
 
 int WebApp::HandleConnection(MHD_Connection * connection, const char * url,
                              const char * method, const char * version) {
@@ -81,7 +81,7 @@ int WebApp::HandleConnection(MHD_Connection * connection, const char * url,
   }
 
   if (url == std::string("/")) {
-    return HandleGetBuffer(connection, favicon_, "text/html");
+    return HandleGetBuffer(connection, video_player_, "text/html");
   } else if (url == std::string("/favicon.ico")) {
     return HandleGetBuffer(connection, favicon_, "image/x-icon");
   } else if (url == std::string("/video_stream")) {
