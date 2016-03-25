@@ -49,8 +49,7 @@ STREAM_SELECT_REPLY = 0x71
 #endif
 };
 
-using Magic = std::integral_constant<uint32_t, 0x43534f46>;
-  // FOSC
+using Magic = std::integral_constant<uint32_t, 0x43534f46>;  // FOSC
 
 enum class Videostream : uint8_t {
   MAIN = 0,
@@ -290,11 +289,11 @@ struct Sizer {
 };
 
 template<typename T>
-std::pair<T, asio::const_buffer> read(asio::const_buffer b) {
+T read(asio::const_buffer b) {
   Reader r(std::move(b));
   T res;
   r(res);
-  return std::make_pair(res, r.buf_);
+  return res;
 }
 
 template<typename T>
@@ -478,8 +477,7 @@ void Foscam::ReadHeader() {
         if (!ec) {
           foscam_api::Header header;
           asio::const_buffer buf_rest;
-          std::tie(header, buf_rest) =
-              read<foscam_api::Header>(asio::buffer(*header_buf));
+          header = read<foscam_api::Header>(asio::buffer(*header_buf));
 
           HandleEvent(header);
         } else {
@@ -503,8 +501,7 @@ void Foscam::HandleEvent(foscam_api::Header header) {
             if (!ec) {
               foscam_api::VideoOnReply reply;
               asio::const_buffer buf_rest;
-              std::tie(reply, buf_rest) =
-                  read<foscam_api::VideoOnReply>(asio::buffer(*reply_buf));
+              reply = read<foscam_api::VideoOnReply>(asio::buffer(*reply_buf));
 
               if (reply.failed) {
                 throw FoscamException("Failed to enable video.");
@@ -531,9 +528,7 @@ void Foscam::HandleEvent(foscam_api::Header header) {
                                           std::size_t) {
             if (!ec) {
               foscam_api::AudioOnReply reply;
-              asio::const_buffer buf_rest;
-              std::tie(reply, buf_rest) =
-                  read<foscam_api::AudioOnReply>(asio::buffer(*reply_buf));
+              reply = read<foscam_api::AudioOnReply>(asio::buffer(*reply_buf));
 
               if (reply.failed) {
                 throw FoscamException("Failed to enable video.");
@@ -584,10 +579,8 @@ void Foscam::HandleEvent(foscam_api::Header header) {
               boost::system::error_code ec, std::size_t) {
             if (!ec) {
               foscam_api::AudioDataHeader audio_data_header;
-              asio::const_buffer buf_rest;
-              std::tie(audio_data_header, buf_rest) =
-                  read<foscam_api::AudioDataHeader>(
-                      asio::buffer(*audio_data_header_buf));
+              audio_data_header = read<foscam_api::AudioDataHeader>(
+                  asio::buffer(*audio_data_header_buf));
 
               auto audio_data_buf =
                   std::make_shared<std::vector<uint8_t> >(audio_data_size);
