@@ -37,21 +37,25 @@ int HandleConnectionCallback(
     void * callback_object, MHD_Connection * connection, const char * url,
     const char * method, const char * version,
     const char *, size_t *, void **) {
-  WebApp * pApp = reinterpret_cast<WebApp *>(callback_object);
+  auto app = reinterpret_cast<WebApp *>(callback_object);
 
-  return pApp->HandleConnection(connection, url, method,
+  return app->HandleConnection(connection, url, method,
                                 version);
 }
 
-ssize_t HandleVideoStreamCallback(void * callback_object, uint64_t position,
+static ssize_t HandleVideoStreamCallback(void * callback_object, uint64_t position,
                                   char * buffer, size_t max_size) {
-  WebApp * pApp = reinterpret_cast<WebApp *>(callback_object);
+  auto stream = reinterpret_cast<Foscam::Stream *>(callback_object);
 
-  return pApp->HandleVideoStream(reinterpret_cast<uint8_t *>(buffer),
-                                 max_size);
+  return stream->GetVideoStreamData(reinterpret_cast<uint8_t *>(buffer),
+                                    max_size);
 }
 
-WebApp::WebApp(std::shared_ptr<foscam_hd::IPCamInterface> cam)
+static void FreeVideoStreamCallback(void * callback_object) {
+  delete reinterpret_cast<Foscam::Stream *>(callback_object);
+}
+
+WebApp::WebApp(std::shared_ptr<Foscam> cam)
     : cam_(cam), http_server_(nullptr) {
   BufferFile("favicon.ico", favicon_);
   BufferFile("video_player.html", video_player_);
@@ -106,18 +110,18 @@ int WebApp::HandleGetBuffer(struct MHD_Connection * connection,
 }
 
 int WebApp::HandleGetVideoStream(struct MHD_Connection * connection) {
+
+  auto stream = cam_->CreateStream();
+
   MHD_Response * response = MHD_create_response_from_callback(
-      MHD_SIZE_UNKNOWN, 1024, HandleVideoStreamCallback, this, nullptr);
+      MHD_SIZE_UNKNOWN, 1024, HandleVideoStreamCallback,
+      stream.release(), FreeVideoStreamCallback);
   MHD_add_response_header(response, "Content-Type", "video/mp4");
 
   auto ret = MHD_queue_response(connection, MHD_HTTP_OK, response);
   MHD_destroy_response(response);
 
   return ret;
-}
-
-ssize_t WebApp::HandleVideoStream(uint8_t * buffer, size_t max_size) {
-  return cam_->GetVideoStreamData(buffer, max_size);
 }
 
 }  // namespace foscam_hd

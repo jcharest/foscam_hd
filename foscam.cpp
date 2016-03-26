@@ -3,14 +3,16 @@
 #include <endian.h>
 
 #include <iostream>
+#include <sstream>
 #include <utility>
 #include <vector>
 #include <boost/fusion/include/define_struct.hpp>
 #include <boost/fusion/include/for_each.hpp>
-#include <boost/shared_array.hpp>
+#include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/xml_parser.hpp>
 
-namespace asio = boost::asio;
-using asio::ip::tcp;
+namespace baio = boost::asio;
+namespace bpt = boost::property_tree;
 
 namespace foscam_api {
 
@@ -141,23 +143,17 @@ char hton(char v) { return v; }
 
 namespace {
 
-const std::string CREATE_CONN_MESSAGE_START =
-    "SERVERPUSH / HTTP/1.1\r\nHost: ";
-const std::string CREATE_CONN_MESSAGE_END =
-  "\r\nAccept:*/*\r\nConnection: Close\r\n\r\n";
-const unsigned int MAX_QUEUE_SIZE = 1024 * 1024;
-
 struct Reader {
-  mutable asio::const_buffer buf_;
+  mutable baio::const_buffer buf_;
 
-  explicit Reader(asio::const_buffer buf)
+  explicit Reader(baio::const_buffer buf)
       : buf_(std::move(buf)) {
   }
 
   template<class T>
   auto operator()(T & val) const ->
   typename std::enable_if<std::is_integral<T>::value>::type {
-    val = endian::ntoh(*asio::buffer_cast<T const*>(buf_));
+    val = endian::ntoh(*baio::buffer_cast<T const*>(buf_));
     buf_ = buf_ + sizeof(T);
   }
 
@@ -200,9 +196,9 @@ struct Reader {
 };
 
 struct Writer {
-  mutable asio::mutable_buffer buf_;
+  mutable baio::mutable_buffer buf_;
 
-  explicit Writer(asio::mutable_buffer buf)
+  explicit Writer(baio::mutable_buffer buf)
       : buf_(std::move(buf)) {
   }
 
@@ -210,7 +206,7 @@ struct Writer {
   auto operator()(T const& val) const ->
   typename std::enable_if<std::is_integral<T>::value>::type {
     T tmp = endian::hton(val);
-    asio::buffer_copy(buf_, asio::buffer(&tmp, sizeof(T)));
+    baio::buffer_copy(buf_, baio::buffer(&tmp, sizeof(T)));
     buf_ = buf_ + sizeof(T);
   }
 
@@ -289,7 +285,7 @@ struct Sizer {
 };
 
 template<typename T>
-T read(asio::const_buffer b) {
+T read(baio::const_buffer b) {
   Reader r(std::move(b));
   T res;
   r(res);
@@ -297,7 +293,7 @@ T read(asio::const_buffer b) {
 }
 
 template<typename T>
-asio::mutable_buffer write(asio::mutable_buffer b, T const& val) {
+baio::mutable_buffer write(baio::mutable_buffer b, T const& val) {
   Writer w(std::move(b));
   w(val);
   return w.buf_;
@@ -313,12 +309,13 @@ size_t get_size() {
 
 class ReadPacketFunc : public foscam_hd::InDataFunctor {
  public:
-  explicit ReadPacketFunc(boost::lockfree::spsc_queue<uint8_t> & data_buffer)
+  explicit ReadPacketFunc(foscam_hd::PipeBuffer & data_buffer)
       : data_buffer_(data_buffer) {
   }
 
   int operator()(uint8_t * buffer, int buffer_size) override {
-    return data_buffer_.pop(buffer, buffer_size);
+    return data_buffer_.wait_and_pop(buffer, buffer_size,
+                                     std::chrono::milliseconds(100));
   }
 
   size_t GetAvailableData() override {
@@ -326,25 +323,25 @@ class ReadPacketFunc : public foscam_hd::InDataFunctor {
   }
 
  private:
-  boost::lockfree::spsc_queue<uint8_t> & data_buffer_;
+  foscam_hd::PipeBuffer & data_buffer_;
 };
 
 class VideoStreamFunc : public foscam_hd::OutStreamFunctor {
  public:
-  explicit VideoStreamFunc(boost::lockfree::spsc_queue<uint8_t> & data_buffer)
+  explicit VideoStreamFunc(foscam_hd::PipeBuffer & data_buffer)
       : data_buffer_(data_buffer) {
   }
 
-  int operator()(const uint8_t * buffer, int buffer_size) override {
-    return data_buffer_.push(buffer, buffer_size);
+  void operator()(const uint8_t * buffer, int buffer_size) override {
+    data_buffer_.push(buffer, buffer_size);
   }
 
  private:
-  boost::lockfree::spsc_queue<uint8_t> & data_buffer_;
+  foscam_hd::PipeBuffer & data_buffer_;
 };
 
 template<typename T>
-std::vector<uint8_t> PrepareCommand(foscam_api::Command type,
+std::vector<uint8_t> PrepareLowLevelCommand(foscam_api::Command type,
     std::function<void(T &)> yield_command_func) {
   foscam_api::Header header;
   header.type = type;
@@ -354,10 +351,92 @@ std::vector<uint8_t> PrepareCommand(foscam_api::Command type,
 
   auto header_size = get_size<foscam_api::Header>();
   std::vector<uint8_t> message_buf(header_size + header.size);
-  write(asio::buffer(message_buf), header);
-  write(asio::buffer(message_buf) + header_size, request);
+  write(baio::buffer(message_buf), header);
+  write(baio::buffer(message_buf) + header_size, request);
 
   return message_buf;
+}
+
+void PrepareHTTPRequest(const std::string & method, const std::string & path,
+                  const std::string & host, const std::string & port,
+                  baio::streambuf & command) {
+  std::ostream command_stream(&command);
+
+  command_stream << method << " " << path << " HTTP/1.0\r\n";
+  command_stream << "Host: " << host << ":" << port << "\r\n";
+  command_stream << "Accept: */*\r\n";
+  command_stream << "Connection: close\r\n\r\n";
+}
+
+bpt::ptree ReadCgiResponse(baio::ip::tcp::socket & socket)
+{
+  // Read status line
+  baio::streambuf response;
+  {
+    baio::read_until(socket, response, "\r\n");
+    std::istream response_stream(&response);
+
+    std::string http_version;
+    response_stream >> http_version;
+
+    unsigned int status_code;
+    response_stream >> status_code;
+
+    std::string status_message;
+    std::getline(response_stream, status_message);
+    if (!response_stream || http_version.substr(0, 5) != "HTTP/")
+    {
+      throw foscam_hd::FoscamException("Invalid response");
+    }
+    if (status_code != 200)
+    {
+      throw foscam_hd::FoscamException("Response returned with status code " +
+                                       std::to_string(status_code));
+    }
+  }
+
+  // Skip headers
+
+  std::stringstream data;
+  {
+    baio::read_until(socket, response, "\r\n\r\n");
+    std::istream response_stream(&response);
+    std::string header;
+    while (std::getline(response_stream, header) && header != "\r");
+
+    // Write whatever content we already have to output.
+    if (response.size() > 0)
+      data << &response;
+  }
+
+  // Read rest of data
+  boost::system::error_code ec;
+  do {
+    baio::read(socket, response, baio::transfer_at_least(1), ec);
+    if (response.size() > 0)
+      data << &response;
+  } while(!ec);
+
+  // Parse data
+  bpt::ptree response_tree;
+  bpt::read_xml(data, response_tree);
+
+  return response_tree;
+}
+
+bpt::ptree ExecuteCgiCommand(
+    const std::string & method, const std::string & path,
+    const std::string & host, const std::string & port,
+    baio::io_service & io_service) {
+  baio::ip::tcp::resolver resolver(io_service);
+  baio::ip::tcp::socket socket(io_service);
+  baio::connect(socket, resolver.resolve({host, port}));
+
+  baio::streambuf request;
+  PrepareHTTPRequest(method, path, host, port, request);
+
+  baio::write(socket, request);
+  return ReadCgiResponse(socket);
 }
 
 }  // namespace
@@ -372,29 +451,56 @@ const char* FoscamException::what() const noexcept {
   return what_.c_str();
 }
 
+Foscam::Stream::Stream(Foscam & parent, const int framerate)
+    : parent_(parent),
+      remuxer_(std::make_unique<ReadPacketFunc>(video_buffer_),
+               std::make_unique<ReadPacketFunc>(audio_buffer_), framerate,
+               std::make_unique<VideoStreamFunc>(video_stream_buffer_))
+{
+  parent_.active_streams_.insert(this);
+}
+
+Foscam::Stream::~Stream()
+{
+  parent_.active_streams_.erase(this);
+}
+
+unsigned int Foscam::Stream::GetVideoStreamData(uint8_t * data,
+                                                size_t data_size) {
+  return video_stream_buffer_.wait_and_pop(data, data_size,
+                                           std::chrono::milliseconds(100));
+}
+
 Foscam::Foscam(const std::string & host, unsigned int port, unsigned int uid,
                const std::string & user, const std::string & password,
-               const int framerate, asio::io_service & io_service)
-  : io_service_(io_service),
-    socket_(io_service),
-    uid_(uid),
-    user_(user),
-    password_(password),
-    framerate_(framerate),
-    video_buffer_(MAX_QUEUE_SIZE),
-    audio_buffer_(MAX_QUEUE_SIZE),
-    video_stream_buffer_(MAX_QUEUE_SIZE),
-    remuxer_(std::make_unique<ReadPacketFunc>(video_buffer_),
-             std::make_unique<ReadPacketFunc>(audio_buffer_), framerate,
-             std::make_unique<VideoStreamFunc>(video_stream_buffer_)) {
+               baio::io_service & io_service)
+    : io_service_(io_service), low_level_api_socket_(io_service),
+      host_(host), port_(std::to_string(port)), uid_(uid), user_(user),
+      password_(password), framerate_(0) {
 
-  tcp::resolver resolver(io_service_);
-  std::string port_str = std::to_string(port);
-  asio::connect(socket_, resolver.resolve({ host, port_str }));
+  baio::ip::tcp::resolver resolver(io_service_);
+  baio::connect(low_level_api_socket_, resolver.resolve({host_, port_}));
 
-  std::string conn_message = CREATE_CONN_MESSAGE_START + host + ":" + port_str
-      + CREATE_CONN_MESSAGE_END;
-  asio::write(socket_, asio::buffer(conn_message));
+  baio::streambuf conn_command;
+  PrepareHTTPRequest("SERVERPUSH", "/", host_, port_, conn_command);
+  baio::write(low_level_api_socket_, conn_command);
+
+  // Get stream type
+  auto response = ExecuteCgiCommand(
+      "GET",
+      "/cgi-bin/CGIProxy.fcgi?cmd=getMainVideoStreamType&usr=" +
+        user_ + "&pwd=" + password_,
+      host_, port_, io_service_);
+  auto stream_type = response.get<unsigned int>("CGI_Result.streamType");
+
+  // Get framerate for stream type
+  response = ExecuteCgiCommand(
+      "GET",
+      "/cgi-bin/CGIProxy.fcgi?cmd=getVideoStreamParam&usr=" +
+        user_ + "&pwd=" + password_,
+      host_, port_, io_service_);
+  framerate_ = response.get<unsigned int>("CGI_Result.frameRate" +
+                                          std::to_string(stream_type));
 }
 
 Foscam::~Foscam() {
@@ -405,7 +511,7 @@ void Foscam::Connect() {
 }
 
 void Foscam::Disconnect() {
-  auto message_buf = PrepareCommand<foscam_api::CloseConnection>(
+  auto message_buf = PrepareLowLevelCommand<foscam_api::CloseConnection>(
       foscam_api::Command::CLOSE_CONNECTION,
       [this](foscam_api::CloseConnection & request){
         strncpy(request.username.str, user_.c_str(),
@@ -414,13 +520,13 @@ void Foscam::Disconnect() {
                 request.password.size);
       });
 
-  asio::write(socket_, asio::buffer(message_buf));
+  baio::write(low_level_api_socket_, baio::buffer(message_buf));
 }
 
 bool Foscam::VideoOn() {
   std::unique_lock<std::mutex> lock(reply_cond_mutex_);
 
-  auto message_buf = PrepareCommand<foscam_api::VideoOnRequest>(
+  auto message_buf = PrepareLowLevelCommand<foscam_api::VideoOnRequest>(
       foscam_api::Command::VIDEO_ON_REQUEST,
       [this](foscam_api::VideoOnRequest & request){
         strncpy(request.username.str, user_.c_str(),
@@ -430,7 +536,7 @@ bool Foscam::VideoOn() {
         request.uid = uid_;
       });
 
-  asio::write(socket_, asio::buffer(message_buf));
+  baio::write(low_level_api_socket_, baio::buffer(message_buf));
 
   video_on_reply_cond_.wait(lock);
 
@@ -440,7 +546,7 @@ bool Foscam::VideoOn() {
 bool Foscam::AudioOn() {
   std::unique_lock<std::mutex> lock(reply_cond_mutex_);
 
-  auto message_buf = PrepareCommand<foscam_api::AudioOnRequest>(
+  auto message_buf = PrepareLowLevelCommand<foscam_api::AudioOnRequest>(
       foscam_api::Command::AUDIO_ON_REQUEST,
       [this](foscam_api::AudioOnRequest & request){
         strncpy(request.username.str, user_.c_str(),
@@ -449,20 +555,16 @@ bool Foscam::AudioOn() {
                 request.password.size);
       });
 
-  asio::write(socket_, asio::buffer(message_buf));
+  baio::write(low_level_api_socket_, baio::buffer(message_buf));
 
   audio_on_reply_cond_.wait(lock);
 
   return true;
 }
 
-unsigned int Foscam::GetAvailableVideoStreamData() {
-  return video_stream_buffer_.read_available();
-}
-
-unsigned int Foscam::GetVideoStreamData(uint8_t * data,
-                                        unsigned int data_size) {
-  return video_stream_buffer_.pop(data, data_size);
+auto Foscam::CreateStream() -> std::unique_ptr<Stream>
+{
+  return std::make_unique<Stream>(*this, framerate_);
 }
 
 void Foscam::ReadHeader() {
@@ -470,18 +572,18 @@ void Foscam::ReadHeader() {
   auto header_size = get_size<foscam_api::Header>();
   auto header_buf = std::make_shared<std::vector<uint8_t> >(header_size);
 
-  asio::async_read(
-      socket_,
-      asio::buffer(*header_buf),
+  baio::async_read(
+      low_level_api_socket_,
+      baio::buffer(*header_buf),
       [this, self, header_buf](boost::system::error_code ec, std::size_t) {
         if (!ec) {
           foscam_api::Header header;
-          asio::const_buffer buf_rest;
-          header = read<foscam_api::Header>(asio::buffer(*header_buf));
+          baio::const_buffer buf_rest;
+          header = read<foscam_api::Header>(baio::buffer(*header_buf));
 
           HandleEvent(header);
         } else {
-          socket_.close();
+          low_level_api_socket_.close();
         }
       });
 }
@@ -493,15 +595,15 @@ void Foscam::HandleEvent(foscam_api::Header header) {
     case foscam_api::Command::VIDEO_ON_REPLY: {
       auto reply_buf = std::make_shared<std::vector<uint8_t> >(header.size);
 
-      asio::async_read(
-          socket_,
-          asio::buffer(*reply_buf),
+      baio::async_read(
+          low_level_api_socket_,
+          baio::buffer(*reply_buf),
           [this, self, header, reply_buf](boost::system::error_code ec,
                                           std::size_t) {
             if (!ec) {
               foscam_api::VideoOnReply reply;
-              asio::const_buffer buf_rest;
-              reply = read<foscam_api::VideoOnReply>(asio::buffer(*reply_buf));
+              baio::const_buffer buf_rest;
+              reply = read<foscam_api::VideoOnReply>(baio::buffer(*reply_buf));
 
               if (reply.failed) {
                 throw FoscamException("Failed to enable video.");
@@ -512,7 +614,7 @@ void Foscam::HandleEvent(foscam_api::Header header) {
               // Ready for another event
               ReadHeader();
             } else {
-              socket_.close();
+              low_level_api_socket_.close();
             }
           });
       break;
@@ -521,14 +623,14 @@ void Foscam::HandleEvent(foscam_api::Header header) {
     case foscam_api::Command::AUDIO_ON_REPLY: {
       auto reply_buf = std::make_shared<std::vector<uint8_t> >(header.size);
 
-      asio::async_read(
-          socket_,
-          asio::buffer(*reply_buf),
+      baio::async_read(
+          low_level_api_socket_,
+          baio::buffer(*reply_buf),
           [this, self, header, reply_buf](boost::system::error_code ec,
                                           std::size_t) {
             if (!ec) {
               foscam_api::AudioOnReply reply;
-              reply = read<foscam_api::AudioOnReply>(asio::buffer(*reply_buf));
+              reply = read<foscam_api::AudioOnReply>(baio::buffer(*reply_buf));
 
               if (reply.failed) {
                 throw FoscamException("Failed to enable video.");
@@ -539,7 +641,7 @@ void Foscam::HandleEvent(foscam_api::Header header) {
               // Ready for another event
               ReadHeader();
             } else {
-              socket_.close();
+              low_level_api_socket_.close();
             }
           });
       break;
@@ -549,19 +651,21 @@ void Foscam::HandleEvent(foscam_api::Header header) {
       auto video_data_buf =
           std::make_shared<std::vector<uint8_t> >(header.size);
 
-      asio::async_read(
-          socket_,
-          asio::buffer(*video_data_buf),
+      baio::async_read(
+          low_level_api_socket_,
+          baio::buffer(*video_data_buf),
           [this, self, video_data_buf](boost::system::error_code ec,
                                        std::size_t) {
             if (!ec) {
-              video_buffer_.push(video_data_buf->data(),
-                                 video_data_buf->size());
+              for (auto stream: active_streams_) {
+                stream->video_buffer_.push(video_data_buf->data(),
+                                          video_data_buf->size());
+              }
 
               // Ready for another event
               ReadHeader();
             } else {
-              socket_.close();
+              low_level_api_socket_.close();
             }
           });
       break;
@@ -572,34 +676,36 @@ void Foscam::HandleEvent(foscam_api::Header header) {
           get_size<foscam_api::AudioDataHeader>());
       size_t audio_data_size = header.size - audio_data_header_buf->size();
 
-      asio::async_read(
-          socket_,
-          asio::buffer(*audio_data_header_buf),
+      baio::async_read(
+          low_level_api_socket_,
+          baio::buffer(*audio_data_header_buf),
           [this, self, audio_data_header_buf, audio_data_size](
               boost::system::error_code ec, std::size_t) {
             if (!ec) {
               foscam_api::AudioDataHeader audio_data_header;
               audio_data_header = read<foscam_api::AudioDataHeader>(
-                  asio::buffer(*audio_data_header_buf));
+                  baio::buffer(*audio_data_header_buf));
 
               auto audio_data_buf =
                   std::make_shared<std::vector<uint8_t> >(audio_data_size);
-              asio::async_read(socket_,
-                  asio::buffer(*audio_data_buf),
+              baio::async_read(low_level_api_socket_,
+                               baio::buffer(*audio_data_buf),
                   [this, self, audio_data_buf](boost::system::error_code ec,
                                                std::size_t) {
                     if (!ec) {
-                      audio_buffer_.push(audio_data_buf->data(),
-                                         audio_data_buf->size());
+                      for (auto stream: active_streams_) {
+                        stream->audio_buffer_.push(audio_data_buf->data(),
+                                                  audio_data_buf->size());
+                      }
 
                       // Ready for another event
                       ReadHeader();
                     } else {
-                      socket_.close();
+                      low_level_api_socket_.close();
                     }
                   });
             } else {
-              socket_.close();
+              low_level_api_socket_.close();
             }
           });
       break;

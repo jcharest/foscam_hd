@@ -41,7 +41,7 @@ class OutStreamFunctor {
   OutStreamFunctor() = default;
   virtual ~OutStreamFunctor() = default;
 
-  virtual int operator()(const uint8_t * buffer, int buffer_size) = 0;
+  virtual void operator()(const uint8_t * buffer, int buffer_size) = 0;
 };
 
 class FFMpegRemuxer {

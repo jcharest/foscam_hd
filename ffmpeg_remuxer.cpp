@@ -4,13 +4,11 @@ extern "C" {
 #include <libavutil/opt.h>
 }
 
-#include <boost/shared_array.hpp>
-
 namespace {
 
-const size_t VIDEO_BUFFER_SIZE = 4 * 1024;
-const size_t VIDEO_PROBE_SIZE = 256 * 1024;
-const size_t AUDIO_BUFFER_SIZE = 4 * 1024;
+const size_t VIDEO_BUFFER_SIZE = 512 * 1024;
+const size_t VIDEO_PROBE_SIZE = VIDEO_BUFFER_SIZE;
+const size_t AUDIO_BUFFER_SIZE = VIDEO_BUFFER_SIZE;
 
 }  // namespace
 
@@ -117,7 +115,9 @@ namespace {
 
 int WriteData(void * opaque, uint8_t * buffer, int buffer_size) {
   OutStreamFunctor * pFunc = reinterpret_cast<OutStreamFunctor *>(opaque);
-  return (*pFunc)(buffer, buffer_size);
+  (*pFunc)(buffer, buffer_size);
+
+  return buffer_size;
 }
 
 }  // namespace
@@ -129,7 +129,7 @@ FFMpegRemuxer::OutputStreamContext::OutputStreamContext(
       video_stream_(nullptr),
       audio_stream_(nullptr),
       stream_func_(move(stream_func)) {
-  avformat_alloc_output_context2(&av_format_, NULL, NULL, "test.mp4");
+  avformat_alloc_output_context2(&av_format_, nullptr, "mp4", nullptr);
   if (!av_format_) {
     throw FFMpegRemuxerException("Failed to allocate avformat context");
   }
@@ -175,7 +175,7 @@ void FFMpegRemuxer::ThreadRun() {
       RemuxVideoPacket(video_input_stream_);
       TranscodeAudioPacket(audio_input_stream_);
     } else {
-      if (video_input_stream_.GetAvailableData() > VIDEO_PROBE_SIZE) {
+      if (video_input_stream_.GetAvailableData() >= VIDEO_PROBE_SIZE) {
         CreateVideoStream(video_input_stream_);
         CreateAudioStream(audio_input_stream_);
 
@@ -201,9 +201,9 @@ void FFMpegRemuxer::ThreadRun() {
 void FFMpegRemuxer::CreateVideoStream(InputStreamContext & input_stream) {
   AVInputFormat * format = av_find_input_format("h264");
   AVDictionary * options = nullptr;
-  av_dict_set_int(&options, "probesize2", VIDEO_PROBE_SIZE, 0);
   av_dict_set(&options, "framerate", std::to_string(framerate_).c_str(), 0);
-
+  input_stream.av_format_->probesize = VIDEO_PROBE_SIZE;
+  //input_stream.av_format_->flags |= AVFMT_FLAG_GENPTS | AVFMT_FLAG_NOBUFFER;
   auto ret = avformat_open_input(&input_stream.av_format_, nullptr, format,
                                  &options);
   if (ret < 0) {
@@ -216,6 +216,7 @@ void FFMpegRemuxer::CreateVideoStream(InputStreamContext & input_stream) {
   }
 
   AVStream * in_stream = input_stream.av_format_->streams[0];
+  in_stream->skip_to_keyframe = true;
   av_dump_format(input_stream.av_format_, 0, "Video", 0);
 
   // Create output stream
@@ -233,6 +234,8 @@ void FFMpegRemuxer::CreateVideoStream(InputStreamContext & input_stream) {
 
   output_stream_.video_stream_->codec->codec_tag = 0;
   output_stream_.video_stream_->time_base = in_stream->codec->time_base;
+  output_stream_.video_stream_->codec->time_base.num = 1;
+  output_stream_.video_stream_->codec->time_base.den = framerate_;
 }
 
 void FFMpegRemuxer::CreateAudioStream(
@@ -274,14 +277,13 @@ void FFMpegRemuxer::CreateAudioStream(
   }
 
   output_stream_.audio_stream_->time_base = in_stream->time_base;
-  output_stream_.audio_stream_->codec->sample_rate =
-      in_stream->codec->sample_rate;
-  output_stream_.audio_stream_->codec->sample_fmt = AV_SAMPLE_FMT_FLT;
+  output_stream_.audio_stream_->codec->sample_rate = 44100;
+  output_stream_.audio_stream_->codec->sample_fmt = AV_SAMPLE_FMT_S16;
   output_stream_.audio_stream_->codec->channels = in_stream->codec->channels;
   output_stream_.audio_stream_->codec->channel_layout =
       in_stream->codec->channel_layout;
   ret = avcodec_open2(output_stream_.audio_stream_->codec,
-                      avcodec_find_encoder(AV_CODEC_ID_AC3), nullptr);
+                      avcodec_find_encoder(AV_CODEC_ID_MP3), nullptr);
   if (ret < 0) {
     throw FFMpegRemuxerException("Failed to open encoder");
   }

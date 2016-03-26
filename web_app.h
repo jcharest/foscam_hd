@@ -3,9 +3,10 @@
 
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
-#include "ip_cam_interface.h"
+#include "foscam.h"
 
 struct MHD_Daemon;
 struct MHD_Connection;
@@ -24,7 +25,7 @@ class WebAppException : public std::exception {
 
 class WebApp {
  public:
-  explicit WebApp(std::shared_ptr<foscam_hd::IPCamInterface> cam);
+  explicit WebApp(std::shared_ptr<Foscam> cam);
   ~WebApp();
 
  private:
@@ -35,17 +36,13 @@ class WebApp {
                       const std::vector<uint8_t> & buffer,
                       const std::string & mime_type);
   int HandleGetVideoStream(struct MHD_Connection * connection);
-  ssize_t HandleVideoStream(uint8_t * buffer, size_t max_size);
 
   friend int HandleConnectionCallback(
       void * callback_object, MHD_Connection * connection,
       const char * url, const char * method,
       const char * version, const char *, size_t *, void **);
-  friend ssize_t HandleVideoStreamCallback(
-      void * callback_object, uint64_t position, char * buffer,
-      size_t max_size);
 
-  std::shared_ptr<foscam_hd::IPCamInterface> cam_;
+  std::shared_ptr<Foscam> cam_;
   struct MHD_Daemon * http_server_;
   std::vector<uint8_t> favicon_;
   std::vector<uint8_t> video_player_;

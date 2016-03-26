@@ -5,12 +5,12 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 
 #include <boost/asio.hpp>
-#include <boost/lockfree/spsc_queue.hpp>
 
-#include "ip_cam_interface.h"
 #include "ffmpeg_remuxer.h"
+#include "pipe_buffer.h"
 
 namespace foscam_api {
   struct Header;
@@ -28,40 +28,56 @@ class FoscamException : public std::exception {
   std::string what_;
 };
 
-class Foscam : public IPCamInterface,
-               public std::enable_shared_from_this<Foscam> {
+class Foscam : public std::enable_shared_from_this<Foscam> {
  public:
+  class Stream {
+   public:
+    Stream(Foscam & parent, const int framerate);
+    ~Stream();
+
+    unsigned int GetVideoStreamData(uint8_t * data, size_t data_length);
+
+   private:
+    friend class Foscam;
+
+    Foscam & parent_;
+
+    PipeBuffer video_buffer_;
+    PipeBuffer audio_buffer_;
+    PipeBuffer video_stream_buffer_;
+
+    FFMpegRemuxer remuxer_;
+  };
+
   Foscam(const std::string & host, unsigned int port, unsigned int uid,
          const std::string & user, const std::string & password,
-         const int framerate, boost::asio::io_service & io_service);
+         boost::asio::io_service & io_service);
   virtual ~Foscam();
 
-  void Connect() override;
-  void Disconnect() override;
-  bool VideoOn() override;
-  bool AudioOn() override;
-  unsigned int GetAvailableVideoStreamData() override;
-  unsigned int GetVideoStreamData(uint8_t * data,
-                                  unsigned int data_length) override;
+  void Connect();
+  void Disconnect();
+  bool VideoOn();
+  bool AudioOn();
+
+  std::unique_ptr<Stream> CreateStream();
 
  private:
   void ReadHeader();
   void HandleEvent(foscam_api::Header header);
 
-  boost::asio::io_service& io_service_;
-  boost::asio::ip::tcp::socket socket_;
+  boost::asio::io_service & io_service_;
+  boost::asio::ip::tcp::socket low_level_api_socket_;
+  const std::string host_;
+  const std::string port_;
   unsigned int uid_;
   const std::string user_;
   const std::string password_;
-  const int framerate_;
+  int framerate_;
   std::mutex reply_cond_mutex_;
   std::condition_variable video_on_reply_cond_;
   std::condition_variable audio_on_reply_cond_;
-  boost::lockfree::spsc_queue<uint8_t> video_buffer_;
-  boost::lockfree::spsc_queue<uint8_t> audio_buffer_;
-  boost::lockfree::spsc_queue<uint8_t> video_stream_buffer_;
 
-  FFMpegRemuxer remuxer_;
+  std::unordered_set<Stream *> active_streams_;
 
   Foscam(const Foscam &) = delete;
   Foscam(Foscam &&) = delete;
