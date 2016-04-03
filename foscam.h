@@ -9,7 +9,7 @@
 
 #include <boost/asio.hpp>
 
-#include "ffmpeg_remuxer.h"
+#include "ffmpeg_wrapper.h"
 #include "pipe_buffer.h"
 
 namespace foscam_api {
@@ -32,7 +32,7 @@ class Foscam : public std::enable_shared_from_this<Foscam> {
  public:
   class Stream {
    public:
-    Stream(Foscam & parent, const int framerate);
+    Stream(Foscam & parent, const int framerate, bool audio_on);
     ~Stream();
 
     unsigned int GetVideoStreamData(uint8_t * data, size_t data_length);
@@ -46,7 +46,7 @@ class Foscam : public std::enable_shared_from_this<Foscam> {
     PipeBuffer audio_buffer_;
     PipeBuffer video_stream_buffer_;
 
-    FFMpegRemuxer remuxer_;
+    ffmpeg_wrapper::FFMpegWrapper remuxer_;
   };
 
   Foscam(const std::string & host, unsigned int port, unsigned int uid,
@@ -76,6 +76,7 @@ class Foscam : public std::enable_shared_from_this<Foscam> {
   std::mutex reply_cond_mutex_;
   std::condition_variable video_on_reply_cond_;
   std::condition_variable audio_on_reply_cond_;
+  bool audio_on_;
 
   std::unordered_set<Stream *> active_streams_;
 

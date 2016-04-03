@@ -114,7 +114,7 @@ int WebApp::HandleGetVideoStream(struct MHD_Connection * connection) {
   auto stream = cam_->CreateStream();
 
   MHD_Response * response = MHD_create_response_from_callback(
-      MHD_SIZE_UNKNOWN, 1024, HandleVideoStreamCallback,
+      MHD_SIZE_UNKNOWN, 16 * 1024, HandleVideoStreamCallback,
       stream.release(), FreeVideoStreamCallback);
   MHD_add_response_header(response, "Content-Type", "video/mp4");
 

@@ -307,7 +307,7 @@ size_t get_size() {
   return s.size_;
 }
 
-class ReadPacketFunc : public foscam_hd::InDataFunctor {
+class ReadPacketFunc : public ffmpeg_wrapper::InDataFunctor {
  public:
   explicit ReadPacketFunc(foscam_hd::PipeBuffer & data_buffer)
       : data_buffer_(data_buffer) {
@@ -315,10 +315,10 @@ class ReadPacketFunc : public foscam_hd::InDataFunctor {
 
   int operator()(uint8_t * buffer, int buffer_size) override {
     return data_buffer_.wait_and_pop(buffer, buffer_size,
-                                     std::chrono::milliseconds(100));
+                                     std::chrono::milliseconds(10));
   }
 
-  size_t GetAvailableData() override {
+  size_t GetAvailableData() const override {
     return data_buffer_.read_available();
   }
 
@@ -326,7 +326,7 @@ class ReadPacketFunc : public foscam_hd::InDataFunctor {
   foscam_hd::PipeBuffer & data_buffer_;
 };
 
-class VideoStreamFunc : public foscam_hd::OutStreamFunctor {
+class VideoStreamFunc : public ffmpeg_wrapper::OutStreamFunctor {
  public:
   explicit VideoStreamFunc(foscam_hd::PipeBuffer & data_buffer)
       : data_buffer_(data_buffer) {
@@ -417,6 +417,8 @@ bpt::ptree ReadCgiResponse(baio::ip::tcp::socket & socket)
       data << &response;
   } while(!ec);
 
+  std::cout << data.str() << std::endl;
+
   // Parse data
   bpt::ptree response_tree;
   bpt::read_xml(data, response_tree);
@@ -451,11 +453,16 @@ const char* FoscamException::what() const noexcept {
   return what_.c_str();
 }
 
-Foscam::Stream::Stream(Foscam & parent, const int framerate)
+Foscam::Stream::Stream(Foscam & parent, const int framerate, bool audio_on)
     : parent_(parent),
-      remuxer_(std::make_unique<ReadPacketFunc>(video_buffer_),
-               std::make_unique<ReadPacketFunc>(audio_buffer_), framerate,
-               std::make_unique<VideoStreamFunc>(video_stream_buffer_))
+      remuxer_(
+          std::make_unique<ReadPacketFunc>(video_buffer_),
+          {"-f", "h264", "-r", "30", "-probesize", "1024"},
+          audio_on ? std::make_unique<ReadPacketFunc>(audio_buffer_) : nullptr,
+          {"-f", "u16le", "-ar", "8000", "-ac", "1"},
+          std::make_unique<VideoStreamFunc>(video_stream_buffer_),
+          {"-vcodec", "copy", "-f", "mp4", "-reset_timestamps", "1",
+           "-movflags", "empty_moov+default_base_moof+frag_keyframe"})
 {
   parent_.active_streams_.insert(this);
 }
@@ -468,7 +475,7 @@ Foscam::Stream::~Stream()
 unsigned int Foscam::Stream::GetVideoStreamData(uint8_t * data,
                                                 size_t data_size) {
   return video_stream_buffer_.wait_and_pop(data, data_size,
-                                           std::chrono::milliseconds(100));
+                                           std::chrono::milliseconds(10));
 }
 
 Foscam::Foscam(const std::string & host, unsigned int port, unsigned int uid,
@@ -476,7 +483,7 @@ Foscam::Foscam(const std::string & host, unsigned int port, unsigned int uid,
                baio::io_service & io_service)
     : io_service_(io_service), low_level_api_socket_(io_service),
       host_(host), port_(std::to_string(port)), uid_(uid), user_(user),
-      password_(password), framerate_(0) {
+      password_(password), framerate_(0), audio_on_(false) {
 
   baio::ip::tcp::resolver resolver(io_service_);
   baio::connect(low_level_api_socket_, resolver.resolve({host_, port_}));
@@ -559,12 +566,12 @@ bool Foscam::AudioOn() {
 
   audio_on_reply_cond_.wait(lock);
 
-  return true;
+  return audio_on_;
 }
 
 auto Foscam::CreateStream() -> std::unique_ptr<Stream>
 {
-  return std::make_unique<Stream>(*this, framerate_);
+  return std::make_unique<Stream>(*this, framerate_, audio_on_);
 }
 
 void Foscam::ReadHeader() {
@@ -636,6 +643,7 @@ void Foscam::HandleEvent(foscam_api::Header header) {
                 throw FoscamException("Failed to enable video.");
               }
 
+              audio_on_ = true;
               audio_on_reply_cond_.notify_one();
 
               // Ready for another event

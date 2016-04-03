@@ -9,7 +9,7 @@ int main(int argc, char * argv[]) {
   std::shared_ptr<foscam_hd::Foscam> cam;
   try {
     cam = std::make_shared<foscam_hd::Foscam>(
-        "192.168.1.8", 88, time(NULL), "admin", "***REMOVED***", io_service);
+        "192.168.1.8", 88, time(NULL), "hugcam", "***REMOVED***", io_service);
     cam->Connect();
   } catch (std::exception & ex) {
     std::cerr << "Failed to connect to camera: " << ex.what() << std::endl;

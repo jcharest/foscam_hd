@@ -1,0 +1,3 @@
+[submodule "contrib/ffmpeg_wrapper"]
+	path = contrib/ffmpeg_wrapper
+	url = git@github.com:jcharest/ffmpeg_wrapper
