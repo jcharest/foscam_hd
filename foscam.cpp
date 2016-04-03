@@ -417,8 +417,6 @@ bpt::ptree ReadCgiResponse(baio::ip::tcp::socket & socket)
       data << &response;
   } while(!ec);
 
-  std::cout << data.str() << std::endl;
-
   // Parse data
   bpt::ptree response_tree;
   bpt::read_xml(data, response_tree);
